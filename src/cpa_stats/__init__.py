@@ -1,7 +1,8 @@
 """cpa-stats: per-request latency / TTFT / TPS / cost monitoring for CLIProxyAPI.
 
 CLIProxyAPI exposes per-request usage records on a destructive, short-lived
-queue (GET /v0/management/usage-queue pops records). ``cpa-stats collect``
+queue (GET /v8/management/observability/usage/queue, or /v0/management/usage-queue
+on older builds, pops records). ``cpa-stats collect``
 drains that queue into a local SQLite database; every other subcommand only
 reads the database, so any number of viewers can run at the same time.
 

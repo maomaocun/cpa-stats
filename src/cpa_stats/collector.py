@@ -29,10 +29,29 @@ class CPAConfig:
     mgmt_key: str
 
 
+def find_cpa_dir(args) -> Path | None:
+    """Locate the CLIProxyAPI install dir: --cpa-dir / CPA_DIR, then the usual
+    suspects under $HOME."""
+    if args.cpa_dir:
+        d = Path(os.path.expanduser(args.cpa_dir))
+        return d if (d / "config.yaml").exists() else None
+    for cand in (Path.home() / ".config" / "cliproxy",
+                 Path.home() / ".cliproxy",
+                 Path.home() / "cliproxy"):
+        if (cand / "config.yaml").exists():
+            return cand
+    # Legacy per-user installs: ~/cliproxy-<anything>/config.yaml
+    for d in sorted(Path.home().glob("cliproxy-*/config.yaml")):
+        return d.parent
+    return None
+
+
 def load_cpa_config(args) -> CPAConfig:
-    cpa_dir = Path(os.path.expanduser(args.cpa_dir))
+    cpa_dir = find_cpa_dir(args)
     url = args.url or os.environ.get("CPA_URL")
     if not url:
+        if not cpa_dir:
+            die("cannot find a CLIProxyAPI install dir; pass --url or --cpa-dir")
         cfg_path = cpa_dir / "config.yaml"
         if not cfg_path.exists():
             die(f"cannot find {cfg_path}; pass --url or --cpa-dir")
@@ -45,24 +64,59 @@ def load_cpa_config(args) -> CPAConfig:
         url = f"http://127.0.0.1:{m.group(1)}"
     key = os.environ.get("CPA_MGMT_KEY")
     if not key:
-        key_file = Path(os.path.expanduser(args.mgmt_key_file or cpa_dir / "management.key"))
+        if not cpa_dir:
+            die("cannot locate management.key; set CPA_MGMT_KEY, --mgmt-key-file or --cpa-dir")
+        key_file = Path(os.path.expanduser(
+            args.mgmt_key_file or cpa_dir / "management.key"))
         if not key_file.exists():
-            die(f"cannot find management key file {key_file}; set CPA_MGMT_KEY or --mgmt-key-file")
+            die(f"cannot find management key file {key_file}; "
+                "set CPA_MGMT_KEY or --mgmt-key-file")
         key = key_file.read_text().strip()
     return CPAConfig(url=url.rstrip("/"), mgmt_key=key)
 
 
-def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]:
+# Usage-queue endpoint across CPA API versions. Newest first; the first one that
+# does not return 404 wins and is cached for the process lifetime.
+USAGE_QUEUE_PATHS = (
+    "/v8/management/observability/usage/queue",
+    "/v0/management/usage-queue",
+)
+
+_usage_queue_path: str | None = None
+
+
+def _fetch_queue_path(cfg: CPAConfig, path: str, batch: int, timeout: float):
     req = urllib.request.Request(
-        f"{cfg.url}/v0/management/usage-queue?count={batch}",
+        f"{cfg.url}{path}?count={batch}",
         headers={"Authorization": f"Bearer {cfg.mgmt_key}"},
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as resp:
-        data = json.loads(resp.read() or b"[]")
-    if isinstance(data, dict):  # tolerate {"items": [...]} style envelopes
-        data = data.get("items") or data.get("data") or []
-    return data if isinstance(data, list) else []
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"[]"), None
+    except urllib.error.HTTPError as exc:
+        return None, exc
+
+
+def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]:
+    """Drain the usage queue. Auto-detects the management API version."""
+    global _usage_queue_path
+    candidates = [_usage_queue_path] if _usage_queue_path else list(USAGE_QUEUE_PATHS)
+    last_err = None
+    for path in candidates:
+        data, err = _fetch_queue_path(cfg, path, batch, timeout)
+        if err is None:
+            _usage_queue_path = path
+            if isinstance(data, dict):  # tolerate {"items": [...]} envelopes
+                data = data.get("items") or data.get("data") or []
+            return data if isinstance(data, list) else []
+        last_err = err
+        if err.code == 404:
+            continue  # try the next API version
+        raise
+    if last_err:
+        raise last_err
+    return []
 
 
 def cmd_collect(args) -> None:
@@ -132,7 +186,7 @@ def cmd_collect(args) -> None:
         except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
             msg = str(getattr(exc, "reason", exc))
             if isinstance(exc, urllib.error.HTTPError):
-                msg = f"HTTP {exc.code} from usage-queue"
+                msg = f"HTTP {exc.code} from usage queue"
                 if exc.code in (401, 403):
                     msg += " (management key rejected)"
                 elif exc.code == 404:

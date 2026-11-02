@@ -34,7 +34,7 @@ def parse_duration(text: str) -> float:
     return float(m.group(1)) * unit
 
 
-DEFAULT_CPA_DIR = Path.home() / f"cliproxy-{os.environ.get('USER') or os.getlogin()}"
+DEFAULT_CPA_DIR = os.environ.get("CPA_DIR", "")  # empty -> auto-detect in find_cpa_dir()
 DEFAULT_DB = (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
               / "cpa-stats" / "requests.db")
 
@@ -97,10 +97,23 @@ def cmd_doctor(args) -> None:
         sys.exit(1)
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        req = urllib.request.Request(f"{cfg.url}/v0/management/config",
-                                     headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
-        with opener.open(req, timeout=5) as resp:
-            body = json.loads(resp.read() or b"{}")
+        body = None
+        last_code = None
+        for path in ("/v8/management/config", "/v0/management/config"):
+            req = urllib.request.Request(
+                f"{cfg.url}{path}",
+                headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
+            try:
+                with opener.open(req, timeout=5) as resp:
+                    body = json.loads(resp.read() or b"{}")
+                break
+            except urllib.error.HTTPError as exc:
+                last_code = exc.code
+                if exc.code != 404:
+                    raise
+        if body is None:
+            raise urllib.error.HTTPError(cfg.url, last_code or 404,
+                                       "management config not found", {}, None)
         line(True, "management API reachable, key accepted")
         flat = json.dumps(body)
         m = re.search(r'"usage-statistics-enabled":\s*(true|false)', flat)
@@ -144,8 +157,8 @@ def cmd_install_service(args) -> None:
     exe = str(Path(exe).resolve())
     unit = f"""[Unit]
 Description=cpa-stats collector (CLIProxyAPI usage queue -> SQLite)
-After=cliproxy-{os.environ.get('USER')}.service
-Wants=cliproxy-{os.environ.get('USER')}.service
+After=cliproxy-api.service
+Wants=cliproxy-api.service
 
 [Service]
 Type=simple

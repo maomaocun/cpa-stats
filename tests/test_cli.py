@@ -89,6 +89,42 @@ class TestCollect:
             assert len(rows) == 7
             assert rows[0]["token_quality"] == "complete"
 
+    def test_v8_path_preferred(self, tmp_path):
+        """v8 endpoint should be tried first and cached."""
+        from cpa_stats import collector
+
+        collector._usage_queue_path = None  # reset cache
+        seen_paths = []
+
+        recs = [make_rec(1)]
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self_inner):  # noqa: N805
+                seen_paths.append(self_inner.path.split("?")[0])
+                if "v8/management" not in self_inner.path:
+                    self_inner.send_error(404)
+                    return
+                body = json.dumps(recs).encode()
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            db = tmp_path / "r.db"
+            main(["collect", "--db", str(db),
+                  "--url", f"http://127.0.0.1:{server.server_address[1]}",
+                  "--mgmt-key-file", str(self._key(tmp_path)), "--once"])
+            assert seen_paths[0] == "/v8/management/observability/usage/queue"
+            assert "/v0/management/usage-queue" not in seen_paths
+        finally:
+            server.shutdown()
+            collector._usage_queue_path = None
+
     @staticmethod
     def _key(tmp_path):
         k = tmp_path / "management.key"

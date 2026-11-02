@@ -3,15 +3,16 @@
 Per-request latency / TTFT / TPS / cost monitoring for **CLIProxyAPI** (CPA).
 
 CPA exposes per-request usage records on a destructive, short-lived queue
-(`GET /v0/management/usage-queue` pops records). `cpa-stats collect` drains that
+(`GET /v8/management/observability/usage/queue` — or `/v0/management/usage-queue`
+on older builds — pops records). `cpa-stats collect` drains that
 queue into a local SQLite database; every other subcommand only reads the
 database, so any number of viewers can run at the same time.
 
 ```
-CPA (127.0.0.1:27100)
+CPA (127.0.0.1:PORT)
    │  every 2 s, ≤ 500 records per poll
    ▼
-cpa-stats collect  →  SQLite (WAL)  →  watch / tail / summary / export
+cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / export
 ```
 
 ## Install
@@ -107,9 +108,9 @@ If the database write fails after records were popped, they are appended to
 `spool.jsonl` next to the db and replayed on the next start — popped data is
 never lost.
 
-Configuration is auto-discovered from `~/cliproxy-$USER/config.yaml` (port) and
-`management.key`. Override with `CPA_URL`, `CPA_MGMT_KEY`, `CPA_DIR`,
-`CPA_STATS_DB`, or the matching flags.
+Configuration is auto-discovered from `~/.config/cliproxy/config.yaml` (port)
+and `management.key` next to it. Override with `CPA_URL`, `CPA_MGMT_KEY`,
+`CPA_DIR`, `CPA_STATS_DB`, or the matching flags.
 
 ## Database
 
