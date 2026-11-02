@@ -9,10 +9,10 @@ description = "Per-request latency / TTFT / TPS / cost monitoring for CLIProxyAP
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-dependencies = ["rich>=13"]
+dependencies = ["rich>=13", "textual>=0.86"]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 cpa-stats = "cpa_stats.cli:entrypoint"
@@ -22,3 +22,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

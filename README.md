@@ -28,12 +28,33 @@ Requires Python ≥ 3.10 and `rich`.
 ```bash
 cpa-stats collect &                       # start the collector
 cpa-stats                                 # live dashboard (default 1h window)
+cpa-stats tui                             # interactive TUI (keys/mouse)
 cpa-stats -w 15m -m swe-2                 # filter window + model
 cpa-stats tail                            # one line per request, live
 cpa-stats summary --since 7d --by model   # aggregate report
 cpa-stats export --since 7d -o out.csv    # CSV / JSONL export
 cpa-stats prune --older-than 30d          # drop old records
 ```
+
+### `cpa-stats tui`
+
+Interactive dashboard (textual). Same data as `watch`, but navigable:
+
+| key / mouse | action |
+|-|-|
+| `1` `2` `3` `4` | switch window: 15 m / 1 h / 6 h / 24 h |
+| `↑` `↓` / wheel / click | select a row in the focused table |
+| `←` `→` | cycle right-hand tabs (recent · sessions · totals) |
+| `tab` | cycle focus between panels |
+| `enter` | open the request-detail modal |
+| `f` | toggle the model filter input |
+| `p` | pause / resume auto-refresh |
+| `r` | force refresh |
+| `q` / `esc` | quit / close modal |
+
+Three tabs on the right: **recent** (every request, selectable → detail),
+**sessions** (top sessions by tokens), **totals** (all-time rollup + data
+quality).
 
 ## Dashboard
 

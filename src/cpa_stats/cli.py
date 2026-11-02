@@ -199,6 +199,13 @@ def main(argv=None) -> None:
     add_price_arg(w)
     w.set_defaults(func=cmd_watch)
 
+    tu = sub.add_parser("tui", parents=[common],
+                        help="interactive TUI (textual): keys 1-4 window, f filter, enter detail")
+    tu.add_argument("-r", "--refresh", type=float, default=2.0)
+    add_price_arg(tu)
+    from .tui import cmd_tui
+    tu.set_defaults(func=cmd_tui)
+
     t = sub.add_parser("tail", parents=[common, filters], help="stream one line per request")
     t.add_argument("--since", type=parse_duration, default=parse_duration("5m"),
                    help="backfill window (default 5m)")

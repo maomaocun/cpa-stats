@@ -192,6 +192,7 @@ curl -s -x http://127.0.0.1:7890 -o /dev/null -w '%{http_code}\n' -H "Authorizat
 
 ```bash
 cpa-stats                       # 实时面板（默认 1h 窗口）；-w 15m / -m swe-2 / -s <session前缀>
+cpa-stats tui                   # 交互式 TUI：1-4 切窗口，↑↓ 选行，enter 详情，f 过滤，p 暂停
 cpa-stats --price '6,0.6,18'    # 加 est. cost 卡（单价 USD/1M：输入,缓存读,输出）
 cpa-stats tail                  # 每个请求一行
 cpa-stats summary --since 7d --by model|effort|session|account|hour|day
@@ -223,7 +224,7 @@ systemctl --user status cpa-stats ; journalctl --user -u cpa-stats -f
 - 1.1：加 e2e 列和 burst 标记
 - 1.2：拆分 new / c.read / c.write / hit，加 token 卡片，reasoning 列按需显示（1.1 的备份在 `/tmp/opencode/cpa-stats.bak-1.1`，1.2 的备份在 `/tmp/opencode/cpa-stats.bak-1.2`，临时目录，可能被清掉）
 - 1.3：面板顶部新增 all-time 总量卡片行（累计请求、输入/输出 token、缓存读/写、命中率、首条记录时间），用单条聚合 SQL 计算，不把记录拉进内存
-- 2.0：重构成 `cpa_stats` 包（src layout，`pipx/pip install .`）。新增：`--price` 成本估算卡、activity sparkline、top-sessions 表、token 数据质量标记（`token_quality` 列 + 迁移回填）、schema_version 迁移机制、`install-service` 子命令、47 个 pytest、`python -m cpa_stats` 入口、CI 工作流。旧单文件备份在 `/tmp/opencode/cpa-stats.bak-1.2`
+- 2.0：重构成 `cpa_stats` 包（src layout，`pipx/pip install .`）。新增：`--price` 成本估算卡、activity sparkline、top-sessions 表、token 数据质量标记（`token_quality` 列 + 迁移回填）、schema_version 迁移机制、`install-service` 子命令、`cpa-stats tui` 交互界面（textual，方向键/滚轮/tab 切换/详情弹窗）、49 个 pytest、`python -m cpa_stats` 入口、CI 工作流。旧单文件备份在 `/tmp/opencode/cpa-stats.bak-1.2`
 
 ---
 
