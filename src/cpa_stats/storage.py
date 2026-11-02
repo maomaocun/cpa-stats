@@ -58,6 +58,7 @@ MIGRATIONS = {
 
 
 def open_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if readonly:
         # Open the file directly so read-only viewers never create or modify the db.
@@ -78,6 +79,18 @@ def open_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
     except OSError:
         pass
     return conn
+
+
+def open_db_ro(path) -> sqlite3.Connection:
+    """Read-only open with a friendly error when the db does not exist yet."""
+    path = Path(path)
+    if not path.exists():
+        import sys
+
+        print(f"cpa-stats: no database at {path} yet. "
+              "Is the collector running? (cpa-stats doctor)", file=sys.stderr)
+        raise SystemExit(1)
+    return open_db(path, readonly=True)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

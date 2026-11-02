@@ -118,6 +118,18 @@ class TestExport:
         assert recs[0]["token_quality"] == "complete"
 
 
+class TestReadonlyGuards:
+    def test_missing_db_friendly_error(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["export", "--db", str(tmp_path / "missing.db")])
+        assert exc.value.code == 1
+        assert "collector" in capsys.readouterr().err.lower()
+
+    def test_summary_missing_db(self, tmp_path):
+        with pytest.raises(SystemExit):
+            main(["summary", "--db", str(tmp_path / "missing.db")])
+
+
 class TestPriceFlag:
     def test_pricing_attached(self, tmp_path, capsys):
         # `summary` with --price renders without crashing.

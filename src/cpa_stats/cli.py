@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -20,7 +21,7 @@ from . import __version__, __doc__ as DOC
 from .collector import cmd_collect, die, load_cpa_config
 from .format import fmt_age, fmt_tok, window_label
 from .model import COLUMNS, decode_tps, e2e_tps, parse_pricing, token_parts
-from .storage import load_rows, meta_get, open_db, prune
+from .storage import load_rows, meta_get, open_db, open_db_ro, prune
 
 
 def parse_duration(text: str) -> float:
@@ -39,7 +40,7 @@ DEFAULT_DB = (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")
 
 
 def cmd_export(args) -> None:
-    conn = open_db(Path(args.db), readonly=True)
+    conn = open_db_ro(args.db)
     rows = list(reversed(load_rows(conn, time.time() - args.since, args.model, args.session)))
     out = open(args.output, "w", newline="") if args.output else sys.stdout
     fields = [c for c in COLUMNS if c != "raw"] + [
@@ -71,7 +72,12 @@ def cmd_export(args) -> None:
 def cmd_prune(args) -> None:
     conn = open_db(Path(args.db))
     n = prune(conn, args.older_than)
-    conn.execute("VACUUM")
+    if args.vacuum:
+        try:
+            conn.execute("VACUUM")
+            print("vacuumed")
+        except sqlite3.Error as exc:
+            print(f"vacuum failed: {exc}", file=sys.stderr)
     print(f"deleted {n} records older than {window_label(args.older_than)}")
 
 
@@ -131,7 +137,11 @@ def cmd_install_service(args) -> None:
     """Write a systemd --user unit for the collector and enable it."""
     unit_dir = Path.home() / ".config/systemd/user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    exe = shutil.which("cpa-stats") or sys.argv[0]
+    exe = shutil.which("cpa-stats")
+    if not exe:
+        die("cannot find 'cpa-stats' on PATH; install the package first "
+            "(pip install --user .) or run from its directory")
+    exe = str(Path(exe).resolve())
     unit = f"""[Unit]
 Description=cpa-stats collector (CLIProxyAPI usage queue -> SQLite)
 After=cliproxy-{os.environ.get('USER')}.service
@@ -238,6 +248,9 @@ def main(argv=None) -> None:
 
     pr = sub.add_parser("prune", parents=[common], help="delete old records")
     pr.add_argument("--older-than", type=parse_duration, required=True)
+    pr.add_argument("--vacuum", action="store_true",
+                    help="rebuild the db file to reclaim space (locks the db; "
+                         "omit for routine pruning)")
     pr.set_defaults(func=cmd_prune)
 
     d = sub.add_parser("doctor", parents=[common], help="check CPA, collector and database")

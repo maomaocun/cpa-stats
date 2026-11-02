@@ -41,11 +41,11 @@ WINDOWS = {  # key -> seconds
 def build_app():
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Horizontal, HorizontalGroup, Vertical
+    from textual.containers import Horizontal, Vertical
     from textual.reactive import reactive
     from textual.screen import ModalScreen
-    from textual.widgets import (DataTable, Footer, Header, Input, Label,
-                                 RichLog, Static, TabbedContent, TabPane)
+    from textual.widgets import (DataTable, Footer, Header, Input, Static,
+                                 TabbedContent, TabPane)
 
     class DetailScreen(ModalScreen):
         """Modal showing every field of one request row."""
@@ -217,6 +217,20 @@ def build_app():
                 f"[dim]{title}[/]\n[bold]{value}[/]\n[dim]{sub}[/]",
                 classes="statcard")
 
+        def _ensure_cards(self):
+            """Mount stat cards once; update their text in place afterwards."""
+            cards = self.query_one("#cards", Horizontal)
+            if cards.children:
+                return cards.children
+            specs = ["req", "ttft", "tps", "lat", "input", "cache", "output"]
+            if self.pricing and self.pricing.enabled:
+                specs.append("cost")
+            cards.mount(*(self._card(s, "") for s in specs))
+            return cards.children
+
+        def _set_card(self, cards, idx, title, value, sub=""):
+            cards[idx].update(f"[dim]{title}[/]\n[bold]{value}[/]\n[dim]{sub}[/]")
+
         def _render_all(self):
             rows = self.rows
             agg = aggregate(rows, self._window_s(), self.pricing)
@@ -239,33 +253,30 @@ def build_app():
                 + (f"   filter [magenta]{self.model_filter}[/]" if self.model_filter else "")
                 + ("   [yellow]PAUSED[/]" if self.paused else ""))
 
-            # --- cards row
-            cards = self.query_one("#cards", Horizontal)
-            cards.remove_children()
+            # --- cards row (mounted once in _ensure_cards; text updated here)
             ok = agg.n - agg.failed
             succ = f"{ok / agg.n * 100:.1f}% ok" if agg.n else "no requests"
-            cards.mount(
-                self._card(f"req · {WINDOWS[self.window_key][0]}",
-                           f"{agg.n}", f"{succ} · {agg.rpm:.1f}/min" if agg.rpm else succ),
-                self._card("TTFT p50", fmt_ms(agg.ttft_p50),
-                           f"p95 {fmt_ms(agg.ttft_p95)}"),
-                self._card("TPS decode/e2e",
-                           f"{fmt_tps(agg.tps_p50)} / {fmt_tps(agg.e2e_p50)}",
-                           f"p10 {fmt_tps(agg.tps_p10)} · p90 {fmt_tps(agg.tps_p90)}"),
-                self._card("latency p50", fmt_ms(agg.lat_p50),
-                           f"p95 {fmt_ms(agg.lat_p95)}"),
-                self._card("input", fmt_tok(agg.in_tok),
-                           f"{fmt_tok(agg.uncached)} new · "
-                           f"{fmt_tok(agg.cache_read + agg.cache_write)} cached"),
-                self._card("cache", f"hit {fmt_pct(agg.cache_ratio)}",
-                           f"read {fmt_tok(agg.cache_read)} · "
-                           f"write {fmt_tok(agg.cache_write)}"),
-                self._card("output", fmt_tok(agg.out_tok),
-                           f"{agg.burst}× burst" if agg.burst else ""),
-            )
-            if agg.cost_usd is not None:
-                cards.mount(self._card("est. cost", fmt_cost(agg.cost_usd),
-                                       f"all-time {fmt_cost(totals.cost_usd)}"))
+            card_widgets = self._ensure_cards()
+            labels = [
+                (f"req · {WINDOWS[self.window_key][0]}", f"{agg.n}",
+                 f"{succ} · {agg.rpm:.1f}/min" if agg.rpm else succ),
+                ("TTFT p50", fmt_ms(agg.ttft_p50), f"p95 {fmt_ms(agg.ttft_p95)}"),
+                ("TPS decode/e2e", f"{fmt_tps(agg.tps_p50)} / {fmt_tps(agg.e2e_p50)}",
+                 f"p10 {fmt_tps(agg.tps_p10)} · p90 {fmt_tps(agg.tps_p90)}"),
+                ("latency p50", fmt_ms(agg.lat_p50), f"p95 {fmt_ms(agg.lat_p95)}"),
+                ("input", fmt_tok(agg.in_tok),
+                 f"{fmt_tok(agg.uncached)} new · "
+                 f"{fmt_tok(agg.cache_read + agg.cache_write)} cached"),
+                ("cache", f"hit {fmt_pct(agg.cache_ratio)}",
+                 f"read {fmt_tok(agg.cache_read)} · write {fmt_tok(agg.cache_write)}"),
+                ("output", fmt_tok(agg.out_tok),
+                 f"{agg.burst}× burst" if agg.burst else ""),
+            ]
+            if agg.cost_usd is not None and len(card_widgets) > 7:
+                labels.append(("est. cost", fmt_cost(agg.cost_usd),
+                               f"all-time {fmt_cost(totals.cost_usd)}"))
+            for i, (t, v, s) in enumerate(labels):
+                self._set_card(card_widgets, i, t, v, s)
 
             # --- activity sparkline
             counts = bucket_counts(rows, time.time() - self._window_s(),
@@ -394,7 +405,7 @@ def build_app():
 
         def on_data_table_row_selected(self, event):
             # Enter on a highlighted row also opens detail.
-            if event.data_table.id == "requests":
+            if event.data_table.id == "requests-table":
                 self.action_detail()
 
     return StatsApp

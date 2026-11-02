@@ -359,13 +359,9 @@ def render_dashboard(conn, args, console):
 
 def cmd_watch(args) -> None:
     need_rich()
-    from .storage import open_db
+    from .storage import open_db_ro
 
-    if not Path(args.db).exists():
-        from .collector import die
-
-        die(f"no database at {args.db} yet. Is the collector running? (cpa-stats doctor)")
-    conn = open_db(Path(args.db), readonly=True)
+    conn = open_db_ro(args.db)
     console = Console()
     if not console.is_terminal or args.once:
         console.print(render_dashboard(conn, args, console))
@@ -382,9 +378,9 @@ def cmd_watch(args) -> None:
 
 def cmd_tail(args) -> None:
     need_rich()
-    from .storage import open_db
+    from .storage import open_db_ro
 
-    conn = open_db(Path(args.db), readonly=True)
+    conn = open_db_ro(args.db)
     console = Console(highlight=False)
     since = time.time() - args.since if args.since else time.time()
     last_ts, seen = since, set()
@@ -426,7 +422,7 @@ def cmd_tail(args) -> None:
                 if r["failed"] and r["error"]:
                     line.append(f"  {r['status_code']}: {r['error'][:120]}", style="red")
                 console.print(line, soft_wrap=True)
-            if len(seen) > 5000:
+            if len(seen) > 5000 and rows:
                 seen = {r["id"] for r in rows}
             time.sleep(args.refresh)
     except KeyboardInterrupt:
@@ -435,9 +431,9 @@ def cmd_tail(args) -> None:
 
 def cmd_summary(args) -> None:
     need_rich()
-    from .storage import open_db
+    from .storage import open_db_ro
 
-    conn = open_db(Path(args.db), readonly=True)
+    conn = open_db_ro(args.db)
     console = Console()
     rows = load_rows(conn, time.time() - args.since, args.model, args.session)
     agg = aggregate(rows, args.since, getattr(args, "pricing", None))

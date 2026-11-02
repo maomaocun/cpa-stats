@@ -91,9 +91,9 @@ INSERT_SQL = (
 
 def record_to_row(rec: dict) -> tuple:
     """Convert one usage-queue record into a requests-table row (drops sensitive keys)."""
-    tokens = rec.get("tokens") or {}
-    tb = rec.get("token_breakdown") or {}
-    fail = rec.get("fail") or {}
+    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
+    tb = rec.get("token_breakdown") if isinstance(rec.get("token_breakdown"), dict) else {}
+    fail = rec.get("fail") if isinstance(rec.get("fail"), dict) else {}
     ident = rec.get("execution_id") or ""
     digest_src = f"{rec.get('timestamp')}|{rec.get('request_id')}|{ident}|{rec.get('model')}"
     rid = ident or hashlib.sha1(digest_src.encode()).hexdigest()
@@ -105,9 +105,13 @@ def record_to_row(rec: dict) -> tuple:
     if cache_read is None:
         cache_read = tokens.get("cached_tokens")
     error = (fail.get("body") or "")[:2000] or None
+    try:
+        ts = parse_ts(rec["timestamp"]) if rec.get("timestamp") else time.time()
+    except (ValueError, TypeError):
+        ts = time.time()  # a malformed timestamp must not drop the record
     values = {
         "id": rid,
-        "ts": parse_ts(rec["timestamp"]) if rec.get("timestamp") else time.time(),
+        "ts": ts,
         "model": rec.get("model"),
         "alias": rec.get("alias"),
         "response_model": rec.get("response_model"),
