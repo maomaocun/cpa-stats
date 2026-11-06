@@ -188,7 +188,7 @@ are dropped before storage.
 ```bash
 git clone <this repo> && cd cpa-stats
 pip install --user -e '.[test]'
-pytest                    # 47 tests
+pytest                    # 133 tests
 python -m cpa_stats ...   # run without installing
 ```
 
