@@ -6,11 +6,29 @@
 # Prefers the standalone binary from the latest GitHub release (no Python
 # needed); falls back to pipx, then pip --user, installed from the tag.
 # Env: CPA_STATS_REPO (fork), CPA_STATS_TAG (pin a version),
-# CPA_STATS_DEST (binary install path, default ~/.local/bin/cpa-stats).
+# CPA_STATS_DEST (binary install path, default ~/.local/bin/cpa-stats),
+# CPA_STATS_PROXY (http proxy for GitHub; else https_proxy/HTTPS_PROXY;
+# else auto-detected 127.0.0.1:7890 when a local proxy is listening).
 set -eu
 
 REPO="${CPA_STATS_REPO:-maomaocun/cpa-stats}"
 DEST="${CPA_STATS_DEST:-$HOME/.local/bin/cpa-stats}"
+
+PROXY="${CPA_STATS_PROXY:-${https_proxy:-${HTTPS_PROXY:-}}}"
+if [ -z "$PROXY" ]; then
+    # common clash/mihomo local proxy — auto-use when it is listening
+    if curl -fsS -m 2 -o /dev/null --proxy http://127.0.0.1:7890 \
+            https://api.github.com 2>/dev/null; then
+        PROXY="http://127.0.0.1:7890"
+    fi
+fi
+gh_curl() {
+    if [ -n "$PROXY" ]; then
+        curl --proxy "$PROXY" "$@"
+    else
+        curl "$@"
+    fi
+}
 
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$os" in linux|darwin) ;; *) os=linux ;; esac
@@ -22,17 +40,18 @@ esac
 
 TAG="${CPA_STATS_TAG:-}"
 if [ -z "$TAG" ]; then
-    TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    TAG="$(gh_curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
 fi
 [ -n "$TAG" ] || TAG=master
 
 echo "cpa-stats ${TAG} (${os}-${arch})"
+[ -n "$PROXY" ] && echo "via proxy $PROXY"
 
 # 1) standalone binary from the release page
 url="https://github.com/$REPO/releases/download/$TAG/cpa-stats-$os-$arch"
 mkdir -p "$(dirname "$DEST")"
-if curl -fsSL "$url" -o "$DEST"; then
+if gh_curl -fsSL --retry 3 --retry-all-errors -C - "$url" -o "$DEST"; then
     chmod +x "$DEST"
     "$DEST" --version && echo "installed: $DEST"
     exit 0

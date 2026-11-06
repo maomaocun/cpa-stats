@@ -891,6 +891,32 @@ class TestUpgrade:
         out = capsys.readouterr().out
         assert "curl" in out and "/v99.9.9/cpa-stats-" in out
 
+    def test_proxy_opener_env(self, monkeypatch):
+        import cpa_stats.collector as coll
+        monkeypatch.setenv("CPA_STATS_PROXY", "http://proxy.internal:8080")
+        opener = coll.proxy_opener()
+        assert any("ProxyHandler" in type(h).__name__ for h in opener.handlers)
+
+    def test_proxy_opener_local_7890(self, monkeypatch):
+        import socket
+
+        import cpa_stats.collector as coll
+        for v in ("CPA_STATS_PROXY", "https_proxy", "HTTPS_PROXY"):
+            monkeypatch.delenv(v, raising=False)
+        # pretend a local clash proxy is listening
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(socket, "create_connection",
+                            lambda *a, **kw: MagicMock())
+        opener = coll.proxy_opener()
+        assert any("ProxyHandler" in type(h).__name__ for h in opener.handlers)
+        # no proxy listening -> direct
+        def refuse(*a, **kw):
+            raise OSError("nope")
+        monkeypatch.setattr(socket, "create_connection", refuse)
+        opener = coll.proxy_opener()
+        assert not any("ProxyHandler" in type(h).__name__
+                       for h in opener.handlers)
+
 
 class TestInstallSh:
     def test_syntax(self):

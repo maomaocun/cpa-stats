@@ -1,5 +1,7 @@
 # cpa-stats
 
+**English** · [简体中文](README.zh-CN.md)
+
 Per-request latency / TTFT / TPS / cost monitoring for **CLIProxyAPI** (CPA).
 
 CPA exposes per-request usage records on a destructive, short-lived queue
@@ -207,7 +209,7 @@ are dropped before storage.
 ```bash
 git clone <this repo> && cd cpa-stats
 pip install --user -e '.[test]'
-pytest                    # 133 tests
+pytest                    # 143 tests
 python -m cpa_stats ...   # run without installing
 ```
 
