@@ -761,6 +761,16 @@ def quota_pct_series(history_rows, key: str = "weekly_pct") -> list:
             if r[key] is not None]
 
 
+def quota_pace(pct, reset_ts, burn_per_day, now: float):
+    """(budget %/day, burn %/day, over_pace) — the %/day drain that lands on 0
+    exactly at the window reset, vs the current burn. None when unknown."""
+    if pct is None or not reset_ts or reset_ts <= now:
+        return None
+    budget = pct * 86400.0 / (reset_ts - now)
+    over = burn_per_day is not None and burn_per_day > budget * 1.05
+    return budget, burn_per_day, over
+
+
 def signal_pct_series(history_rows, sig_key: str) -> list:
     """Remaining-% series for a codex used-percent signal key, read back from
     the raw signals JSON stored in quota_history. Case-insensitive."""

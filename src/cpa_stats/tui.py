@@ -31,8 +31,8 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
                     cred_sort_key, decode_tps, e2e_tps, field, group_by,
                     parse_credentials, parse_iso_ts, quota_forecast,
-                    quota_pct_series, request_detail_pairs, short_endpoint,
-                    short_model, token_parts)
+                    quota_pace, quota_pct_series, request_detail_pairs,
+                    short_endpoint, short_model, token_parts)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -109,6 +109,18 @@ def build_app():
                     lines.append(
                         f"[dim]{tag:>16}[/]  [cyan]{sparkline(series[-40:])}[/]"
                         f"  {series[-1]}%{escape(eta)}")
+                    p = quota_pace(
+                        getattr(c, key),
+                        c.daily_reset if key == "daily_pct" else c.weekly_reset,
+                        fc[1] if fc else None, time.time())
+                    if p:
+                        budget, burn, over = p
+                        pace_txt = f"[dim]{'pace':>16}[/]  ≤{budget:.0f}%/day"
+                        if burn is not None:
+                            pace_txt += (f" · burning {burn:.0f}%/day → "
+                                         + ("[red]over pace[/]" if over
+                                            else "on pace"))
+                        lines.append(pace_txt)
             if c.retry_after_ts:
                 lines.append(f"[dim]{'retry-after':>16}[/]  "
                              f"{escape(_fmt_reset(c.retry_after_ts))}")

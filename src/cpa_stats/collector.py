@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .storage import (insert_records, meta_set, open_db, prune,
+                      load_quota_history, meta_get, meta_set, open_db, prune,
                       save_quota_history, save_quota_snapshot)
 
 
@@ -239,6 +240,87 @@ def stale_quota_credentials(snap: dict, max_age_s: float, now: float) -> list[st
     return stale
 
 
+def send_webhook(url: str, text: str, timeout: float = 10.0) -> None:
+    """POST a text alert. The payload carries both a generic `text` field and
+    the Lark bot webhook shape (`msg_type`/`content`), so either consumer
+    accepts it. Unlike management calls, webhooks DO honor http(s)_proxy env
+    vars — they are typically external endpoints."""
+    body = json.dumps({"msg_type": "text", "content": {"text": text},
+                       "text": text}, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.build_opener().open(req, timeout=timeout) as resp:
+        resp.read()
+
+
+def check_quota_alerts(conn, creds, args, log) -> None:
+    """Fire webhook alerts on quota state transitions (once per crossing, not
+    every poll): window % below --alert-below, blocked/limited flips, and
+    forecast exhaustion within --alert-eta-hours. State lives in
+    meta.alert_state."""
+    webhook = getattr(args, "alert_webhook", None)
+    if not webhook:
+        return
+    below = float(getattr(args, "alert_below", 20.0))
+    eta_s = float(getattr(args, "alert_eta_hours", 0.0)) * 3600
+    try:
+        state = json.loads(meta_get(conn, "alert_state") or "{}")
+        if not isinstance(state, dict):
+            state = {}
+    except ValueError:
+        state = {}
+    now = time.time()
+    for c in creds:
+        st = state.setdefault(c.name, {})
+        events: list[str] = []
+        for attr, win in (("daily_pct", c.daily_label or "daily"),
+                          ("weekly_pct", c.weekly_label or "weekly")):
+            pct_ = getattr(c, attr)
+            flag = f"low_{attr}"
+            if pct_ is not None and pct_ < below and not st.get(flag):
+                events.append(f"⚠ cpa-stats: {c.account} {win} quota "
+                              f"{pct_}% (< {below:g}%)")
+                st[flag] = True
+            elif pct_ is not None and pct_ >= below and st.get(flag):
+                events.append(f"✅ cpa-stats: {c.account} {win} quota "
+                              f"recovered to {pct_}%")
+                st[flag] = False
+        for flag, cond, label in (("blocked", c.blocked, "blocked"),
+                                  ("limited", c.limited,
+                                   "upstream limit reached")):
+            if cond and not st.get(flag):
+                events.append(f"🚫 cpa-stats: {c.account} {label}")
+                st[flag] = True
+            elif not cond and st.get(flag):
+                events.append(f"✅ cpa-stats: {c.account} no longer {label}")
+                st[flag] = False
+        if eta_s:
+            from .model import quota_forecast
+
+            hist = load_quota_history(conn, 0, c.name)
+            for col, win in (("weekly_pct", c.weekly_label or "weekly"),
+                             ("daily_pct", c.daily_label or "daily")):
+                flag = f"eta_{col}"
+                fc = quota_forecast(hist, col)
+                soon = fc is not None and fc[2] - now < eta_s
+                if soon and not st.get(flag):
+                    events.append(f"⏳ cpa-stats: {c.account} {win} quota → "
+                                  f"0% in {max(0, int(fc[2] - now)) // 60}m")
+                    st[flag] = True
+                elif not soon and st.get(flag):
+                    st[flag] = False
+        if not events:
+            continue
+        meta_set(conn, "alert_state", json.dumps(state))
+        for e in events:
+            try:
+                send_webhook(webhook, e)
+                log(f"alert sent: {e[:100]}")
+            except Exception as exc:  # noqa: BLE001
+                log(f"alert webhook failed: {exc}")
+
+
 def cmd_collect(args) -> None:
     cfgs = load_cpa_configs(args)
     db_path = Path(args.db)
@@ -358,7 +440,9 @@ def cmd_collect(args) -> None:
 
                 with conn:
                     save_quota_snapshot(conn, payload)
-                    save_quota_history(conn, parse_credentials(payload), now)
+                    creds = parse_credentials(payload)
+                    save_quota_history(conn, creds, now)
+                    check_quota_alerts(conn, creds, args, log)
                 if quota_err:
                     log("quota snapshot recovered")
                     quota_err = None

@@ -468,3 +468,99 @@ class TestTopCmd:
         conn.close()
         main(["top", "--db", str(db), "--since", "1d"])
         assert "no requests" in capsys.readouterr().out
+
+
+class TestAlerts:
+    def _args(self, db, webhook):
+        import argparse
+        return argparse.Namespace(alert_webhook=webhook, alert_below=20.0,
+                                  alert_eta_hours=0.0)
+
+    def _db(self, tmp_path):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        conn.close()
+        return db
+
+    def test_alert_fires_once_then_recovers(self, tmp_path):
+        """Crossing the threshold POSTs once; recovery POSTs again."""
+        sent = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self_inner):
+                n = int(self_inner.headers.get("Content-Length") or 0)
+                sent.append(json.loads(self_inner.rfile.read(n)))
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            conn = open_db(self._db(tmp_path))
+            args = self._args(conn, url)
+
+            from cpa_stats.collector import check_quota_alerts
+            from cpa_stats.model import CredInfo
+            low = CredInfo(name="c1", account="a@x", weekly_pct=10)
+            ok = CredInfo(name="c1", account="a@x", weekly_pct=50)
+            log = lambda m: None
+
+            check_quota_alerts(conn, [low], args, log)
+            check_quota_alerts(conn, [low], args, log)   # same state → no dup
+            check_quota_alerts(conn, [ok], args, log)    # recovery
+            assert len(sent) == 2
+            assert "10%" in sent[0]["text"]
+            assert "recovered" in sent[1]["text"]
+            conn.close()
+        finally:
+            server.shutdown()
+
+    def test_alert_cmd_state(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import meta_set
+        meta_set(conn, "alert_state",
+                 '{"c1": {"low_weekly_pct": true, "blocked": false}}')
+        conn.commit()
+        conn.close()
+        main(["alert", "--db", str(db)])
+        out = capsys.readouterr().out
+        assert "low_weekly_pct" in out and "blocked" not in out
+
+
+class TestServe:
+    def test_healthz_and_index(self, tmp_path):
+        import urllib.request
+
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1)])
+        conn.close()
+
+        from cpa_stats.views import make_serve_server
+        import argparse
+        args = argparse.Namespace(
+            db=str(db), window=3600, model=None, session=None, account=None,
+            bind="127.0.0.1", port=0, refresh=5, limit=30, width=120,
+            pricing=None)
+        srv = make_serve_server(args)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/healthz", timeout=3).read()
+            assert body == b"ok"
+            html = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/", timeout=3).read().decode()
+            assert "cpa-stats" in html and "refresh" in html
+            rows = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/rows", timeout=3).read()
+            assert b"e1" in rows
+        finally:
+            srv.shutdown()

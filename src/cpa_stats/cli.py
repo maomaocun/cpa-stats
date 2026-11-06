@@ -331,6 +331,14 @@ def main(argv=None) -> None:
                         "(0 = never refresh, default 300)")
     c.add_argument("--retention-days", type=float, default=90,
                    help="delete records older than this, checked hourly (0 = keep forever)")
+    c.add_argument("--alert-webhook",
+                   help="POST text alerts to this URL on quota transitions "
+                        "(low %, blocked/limited, recovery; Lark bot webhooks work)")
+    c.add_argument("--alert-below", type=float, default=20.0,
+                   help="alert when a quota window drops below this %% (default 20)")
+    c.add_argument("--alert-eta-hours", type=float, default=0.0,
+                   help="also alert when the burn forecast reaches 0%% within "
+                        "N hours (0 = off)")
     c.add_argument("--once", action="store_true", help="drain once and exit")
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(func=cmd_collect)
@@ -344,6 +352,27 @@ def main(argv=None) -> None:
 
     d = sub.add_parser("doctor", parents=[common], help="check CPA, collector and database")
     d.set_defaults(func=cmd_doctor)
+
+    al = sub.add_parser("alert", parents=[common],
+                        help="show alert state / send a test webhook alert")
+    al.add_argument("--webhook", help="POST a test alert to this URL")
+    from .views import cmd_alert, cmd_serve
+    al.set_defaults(func=cmd_alert)
+
+    sv = sub.add_parser("serve", parents=[common, filters],
+                        help="read-only web dashboard with auto-refresh")
+    sv.add_argument("-w", "--window", type=parse_duration,
+                    default=parse_duration("1h"), help="stats window (default 1h)")
+    sv.add_argument("--bind", default="127.0.0.1",
+                    help="bind address (default localhost only)")
+    sv.add_argument("--port", type=int, default=8399)
+    sv.add_argument("-r", "--refresh", type=int, default=5,
+                    help="page auto-refresh seconds")
+    sv.add_argument("-n", "--limit", type=int, default=30,
+                    help="recent rows shown (default 30)")
+    sv.add_argument("--width", type=int, default=140, help="render width")
+    add_price_arg(sv)
+    sv.set_defaults(func=cmd_serve)
 
     i = sub.add_parser("install-service", parents=[common],
                        help="install a systemd --user unit for the collector")

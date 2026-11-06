@@ -37,6 +37,7 @@ cpa-stats show <id>                       # every captured field of one request 
 cpa-stats quota                           # credential quota / cooldowns + burn forecast
 cpa-stats errors                          # failure breakdown by model / status / code / endpoint
 cpa-stats top --since 7d                  # heaviest requests (by tokens / output / cost / latency)
+cpa-stats serve --port 8399               # read-only web dashboard (auto-refresh) + /api/rows
 cpa-stats summary --since 7d --by model   # aggregate report
 cpa-stats export --since 7d -o out.csv    # CSV / JSONL export
 cpa-stats prune --older-than 30d          # drop old records
@@ -123,8 +124,13 @@ leftover provider signals. Devin reads `daily_quota_*`/`weekly_quota_*`; Codex
 computes a burn forecast
 (`−N%/day → 0 in Xd`) and a trend sparkline — including per-named-limit
 trends for Codex `additional-*` windows — so an account heading for
-exhaustion is visible before it is blocked. `watch` also shows a red ⚠ line
-when a credential is blocked or the window failure rate exceeds 5%.
+exhaustion is visible before it is blocked. A `pace ≤N%/day` line compares
+the sustainable burn to the current one ("over pace" → you'll hit 0 before
+the reset). `watch` also shows a red ⚠ line when a credential is blocked or
+the window failure rate exceeds 5%. With `--alert-webhook`, the collector
+POSTs text alerts on quota transitions (window below `--alert-below`,
+blocked/limited flips, recovery, forecast exhaustion within
+`--alert-eta-hours`) — Lark bot webhooks work.
 
 ## Collector
 
@@ -135,6 +141,9 @@ must be a singleton.
 cpa-stats collect                       # foreground
 cpa-stats collect --retention-days 30   # auto-prune, checked hourly
 cpa-stats collect --quota-interval 30   # credentials/quota snapshot every 30 s
+cpa-stats collect --alert-webhook https://open.feishu.cn/...   # Lark/generic webhook alerts
+#   fires on: quota < --alert-below (20%), blocked/limited flips, recovery,
+#   forecast exhaustion within --alert-eta-hours
 cpa-stats install-service               # write + enable a systemd --user unit
 ```
 

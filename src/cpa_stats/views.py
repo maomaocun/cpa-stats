@@ -10,9 +10,9 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
                     bucket_counts, cred_sort_key, decode_tps, e2e_tps, field,
                     group_by, parse_credentials, parse_iso_ts, quota_forecast,
-                    quota_pct_series, request_detail_pairs, short_endpoint,
-                    short_model, signal_pct_series, token_parts,
-                    recovery_stats)
+                    quota_pace, quota_pct_series, request_detail_pairs,
+                    short_endpoint, short_model, signal_pct_series,
+                    token_parts, recovery_stats)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -611,11 +611,41 @@ def cmd_summary(args) -> None:
 
     conn = open_db_ro(args.db)
     console = Console()
-    rows = load_rows(conn, time.time() - args.since, args.model, args.session,
+    now = time.time()
+    rows = load_rows(conn, now - args.since, args.model, args.session,
                      account=getattr(args, "account", None))
     agg = aggregate(rows, args.since, getattr(args, "pricing", None))
     console.print(Text(f"cpa-stats summary · last {window_label(args.since)}", style="bold cyan"))
     console.print(build_cards(agg, window_label(args.since)))
+    prev_rows = [r for r in load_rows(conn, now - 2 * args.since,
+                                    args.model, args.session,
+                                    account=getattr(args, "account", None))
+                 if r["ts"] < now - args.since]
+    if prev_rows:
+        prev = aggregate(prev_rows, args.since)
+
+        def d(cur, old, unit="%"):
+            if not old:
+                return "n/a"
+            diff = (cur - old) / old * 100
+            sign = "+" if diff >= 0 else "−"
+            return f"{sign}{abs(diff):.0f}{unit}"
+
+        fail_now = agg.failed / agg.n * 100 if agg.n else 0
+        fail_prev = prev.failed / prev.n * 100 if prev.n else 0
+        fd = fail_now - fail_prev
+        console.print(Text(
+            f"vs previous {window_label(args.since)}:  "
+            f"req {agg.n} ({d(agg.n, prev.n)})  "
+            f"fail {fail_now:.1f}% ({'+' if fd >= 0 else '−'}"
+            f"{abs(fd):.1f}pt)  "
+            f"in {fmt_tok(agg.in_tok)} ({d(agg.in_tok, prev.in_tok)})  "
+            f"out {fmt_tok(agg.out_tok)} ({d(agg.out_tok, prev.out_tok)})  "
+            f"ttft p50 {fmt_ms(agg.ttft_p50)} "
+            f"({d(agg.ttft_p50 or 0, prev.ttft_p50 or 0)})  "
+            f"lat p50 {fmt_ms(agg.lat_p50)} "
+            f"({d(agg.lat_p50 or 0, prev.lat_p50 or 0)})",
+            style="dim"))
     keyfn = {
         "model": short_model,
         "session": lambda r: (r["session_id"] or "—"),
@@ -764,6 +794,19 @@ def cmd_quota(args) -> None:
                        else "· holding steady")
                 lines.append(f"[dim]{tag:>8}[/]     [cyan]{trend}[/] "
                              f"{escape(tag)} quota {series[-1]}% {escape(eta)}")
+            now = time.time()
+            pct_now = getattr(c, key)
+            reset_ts = c.daily_reset if key == "daily_pct" else c.weekly_reset
+            p = quota_pace(pct_now, reset_ts,
+                           (quota_forecast(hist, key) or (None, None))[1], now)
+            if p:
+                budget, burn, over = p
+                pace_txt = f"[dim]{tag:>8}[/]     pace ≤{budget:.0f}%/day"
+                if burn is not None:
+                    pace_txt += (f" · burning {burn:.0f}%/day → "
+                                 + ("[red]over pace[/]" if over
+                                    else "on pace"))
+                lines.append(pace_txt)
         for lim in c.limits or []:
             bits = []
             for tag in ("short", "long"):
@@ -964,3 +1007,101 @@ def cmd_top(args) -> None:
             *([fmt_cost(cost)] if pricing and pricing.enabled else []),
         )
     console.print(t)
+
+
+def cmd_alert(args) -> None:
+    """`cpa-stats alert` — show alert state, or POST a test webhook alert."""
+    import json
+
+    from .collector import send_webhook
+
+    if getattr(args, "webhook", None):
+        send_webhook(args.webhook, "cpa-stats: test alert ✅")
+        print("sent test alert")
+        return
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    raw = meta_get(conn, "alert_state")
+    if not raw:
+        print("no alert state yet (collector writes it once "
+              "--alert-webhook is set and a threshold is crossed)")
+        return
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        print(raw)
+        return
+    for name, st in state.items():
+        active = [k for k, v in st.items() if v]
+        print(f"{name}: {', '.join(active) if active else 'clear'}")
+
+
+def make_serve_server(args):
+    """`cpa-stats serve` — read-only web dashboard with meta-refresh."""
+    need_rich()
+    import json as _json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from .model import COLUMNS
+    from .storage import open_db_ro
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, body, ctype="text/html; charset=utf-8", code=200):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            try:
+                if path == "/healthz":
+                    return self._send("ok", "text/plain")
+                if path in ("/", "/index.html"):
+                    conn = open_db_ro(args.db)
+                    try:
+                        con = Console(record=True, width=args.width,
+                                      height=120)
+                        con.print(render_dashboard(conn, args, con))
+                        html = con.export_html(inline_styles=True)
+                    finally:
+                        conn.close()
+                    page = ('<!doctype html><meta charset="utf-8">'
+                            f'<meta http-equiv="refresh" '
+                            f'content="{args.refresh}">' + html)
+                    return self._send(page)
+                if path == "/api/rows":
+                    conn = open_db_ro(args.db)
+                    try:
+                        rows = load_rows(
+                            conn, time.time() - args.window,
+                            args.model, args.session, limit=500,
+                            account=getattr(args, "account", None))
+                        out = [{k: r[k] for k in COLUMNS
+                                if k != "raw" and k in r.keys()}
+                               for r in rows]
+                    finally:
+                        conn.close()
+                    return self._send(_json.dumps(out, default=str),
+                                      "application/json")
+                self._send("not found", "text/plain", 404)
+            except Exception as exc:  # noqa: BLE001
+                self._send(f"error: {exc}", "text/plain", 500)
+
+        def log_message(self, *a):
+            pass
+
+    return ThreadingHTTPServer((args.bind, args.port), H)
+
+
+def cmd_serve(args) -> None:
+    srv = make_serve_server(args)
+    print(f"cpa-stats serve: http://{args.bind}:{args.port} "
+          f"(refresh {args.refresh}s · Ctrl-C to quit)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass

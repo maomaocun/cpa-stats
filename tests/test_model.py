@@ -417,6 +417,23 @@ class TestSignalPctSeries:
         assert s == [97, 90]      # remaining = 100 - used, case-insensitive
 
 
+class TestQuotaPace:
+    def test_budget_and_over(self):
+        import time
+        from cpa_stats.model import quota_pace
+        now = time.time()
+        # 70% left, 2 days to reset → budget 35%/day; burning 40 → over pace
+        budget, burn, over = quota_pace(70, now + 2 * 86400, 40.0, now)
+        assert abs(budget - 35.0) < 0.01 and burn == 40.0 and over
+        # slow burn → on pace
+        _, _, over = quota_pace(70, now + 2 * 86400, 10.0, now)
+        assert not over
+        # missing data → None
+        assert quota_pace(None, now + 86400, None, now) is None
+        assert quota_pace(50, None, None, now) is None
+        assert quota_pace(50, now - 10, None, now) is None
+
+
 class TestRecoveryStats:
     def test_median_and_share(self):
         from cpa_stats.model import recovery_stats
