@@ -55,8 +55,10 @@ jobs:
       - name: build onefile binary
         run: |
           if [ "${{ matrix.sys }}" = "true" ]; then PY=python3; else PY=python; fi
-          $PY -m pip install . pyinstaller   # not -e: the system pip on the
-                                           # old runner predates PEP 660
+          $PY -m pip install --user -U pip setuptools wheel  # old runner's
+            # toolchain predates PEP 621 (would build a package literally
+            # named UNKNOWN) and PEP 660 (no editable installs)
+          $PY -m pip install --user . pyinstaller
           $PY -m PyInstaller --onefile --name cpa-stats \
             --collect-all textual --collect-all rich \
             cpa_stats_entry.py
