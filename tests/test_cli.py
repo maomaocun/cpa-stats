@@ -216,7 +216,7 @@ class TestCollect:
         """v8 endpoint should be tried first and cached."""
         from cpa_stats import collector
 
-        collector._usage_queue_path = None  # reset cache
+        collector._usage_queue_path.clear()  # reset cache
         seen_paths = []
 
         recs = [make_rec(1)]
@@ -246,7 +246,7 @@ class TestCollect:
             assert "/v0/management/usage-queue" not in seen_paths
         finally:
             server.shutdown()
-            collector._usage_queue_path = None
+            collector._usage_queue_path.clear()
 
     @staticmethod
     def _key(tmp_path):

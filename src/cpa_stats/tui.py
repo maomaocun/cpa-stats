@@ -225,6 +225,8 @@ def build_app():
             self.creds = []
             self.creds_hist = {}
             self.conn = None
+            self._hm_rows = []
+            self._hm_ts = 0.0
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -437,10 +439,15 @@ def build_app():
                            .strftime("%H:%M:%S"), key=sid)
 
             # --- hourly heatmap (last 7d, independent of the current window)
-            hm_rows = (rows if (win is None or win >= 7 * 86400)
-                       else load_rows(self.conn, time.time() - 7 * 86400,
-                                      self.model_filter or None,
-                                      self.session_filter or None))
+            if win is None or win >= 7 * 86400:
+                hm_rows = rows
+            else:
+                if time.time() - self._hm_ts > 30:
+                    self._hm_rows = load_rows(
+                        self.conn, time.time() - 7 * 86400,
+                        self.model_filter or None, self.session_filter or None)
+                    self._hm_ts = time.time()
+                hm_rows = self._hm_rows
             self.query_one("#heatmap-pane", Static).update(
                 _heatmap_text(hm_rows))
 

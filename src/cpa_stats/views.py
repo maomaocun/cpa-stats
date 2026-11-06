@@ -928,6 +928,10 @@ def cmd_top(args) -> None:
     idx = {"tokens": 1, "output": 2, "cost": 3, "latency": 4}[args.by]
     scored.sort(key=lambda t: (t[idx] is None, -(t[idx] or 0)))
     top = scored[:args.limit]
+    if args.by == "cost" and not (pricing and pricing.enabled):
+        console.print(Text(
+            "hint: pass --price in,cached,out to sort by estimated cost",
+            style="yellow"))
     if not top:
         console.print(Text(
             f"cpa-stats top · last {window_label(args.since)} · "

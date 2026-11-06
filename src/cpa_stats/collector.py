@@ -122,9 +122,12 @@ CREDENTIALS_REFRESH_PATHS = (
 # ProviderSupportsQuotaObservation upstream).
 QUOTA_PROVIDERS = {"claude", "codex", "devin"}
 
-_usage_queue_path: str | None = None
-_credentials_path: str | None = None
-_credentials_refresh_path: str | None = None
+# Endpoint-version probe caches, keyed by instance url — instances may run
+# different CPA builds, so a global cache would ping-pong and force a wasted
+# 404 probe on every poll.
+_usage_queue_path: dict = {}
+_credentials_path: dict = {}
+_credentials_refresh_path: dict = {}
 
 
 def _mgmt_get(cfg: CPAConfig, path: str, timeout: float):
@@ -147,13 +150,13 @@ def _fetch_queue_path(cfg: CPAConfig, path: str, batch: int, timeout: float):
 
 def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]:
     """Drain the usage queue. Auto-detects the management API version."""
-    global _usage_queue_path
-    candidates = [_usage_queue_path] if _usage_queue_path else list(USAGE_QUEUE_PATHS)
+    cached = _usage_queue_path.get(cfg.url)
+    candidates = [cached] if cached else list(USAGE_QUEUE_PATHS)
     last_err = None
     for path in candidates:
         data, err = _fetch_queue_path(cfg, path, batch, timeout)
         if err is None:
-            _usage_queue_path = path
+            _usage_queue_path[cfg.url] = path
             if isinstance(data, dict):  # tolerate {"items": [...]} envelopes
                 data = data.get("items") or data.get("data") or []
             return data if isinstance(data, list) else []
@@ -168,13 +171,13 @@ def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]
 
 def fetch_credentials(cfg: CPAConfig, timeout: float = 10.0) -> dict:
     """Snapshot of managed credentials: quota signals, status, cooldowns."""
-    global _credentials_path
-    candidates = [_credentials_path] if _credentials_path else list(CREDENTIALS_PATHS)
+    cached = _credentials_path.get(cfg.url)
+    candidates = [cached] if cached else list(CREDENTIALS_PATHS)
     last_err = None
     for path in candidates:
         data, err = _mgmt_get(cfg, path, timeout)
         if err is None:
-            _credentials_path = path
+            _credentials_path[cfg.url] = path
             if isinstance(data, list):  # tolerate a bare [...] body
                 data = {"files": data}
             return data if isinstance(data, dict) else {"files": []}
@@ -190,9 +193,8 @@ def fetch_credentials(cfg: CPAConfig, timeout: float = 10.0) -> dict:
 def refresh_credential(cfg: CPAConfig, name: str, timeout: float = 15.0):
     """POST /credentials/refresh?name — CPA re-observes the credential upstream.
     Returns None on success, the HTTPError otherwise."""
-    global _credentials_refresh_path
-    candidates = ([_credentials_refresh_path] if _credentials_refresh_path
-                  else list(CREDENTIALS_REFRESH_PATHS))
+    cached = _credentials_refresh_path.get(cfg.url)
+    candidates = [cached] if cached else list(CREDENTIALS_REFRESH_PATHS)
     body = json.dumps({"name": name}).encode()
     last_err = None
     for path in candidates:
@@ -204,7 +206,7 @@ def refresh_credential(cfg: CPAConfig, name: str, timeout: float = 15.0):
         try:
             with opener.open(req, timeout=timeout) as resp:
                 resp.read()
-            _credentials_refresh_path = path
+            _credentials_refresh_path[cfg.url] = path
             return None
         except urllib.error.HTTPError as exc:
             last_err = exc
@@ -278,9 +280,10 @@ def cmd_collect(args) -> None:
     last_quota = 0.0
     quota_err = None
     while not stop["flag"]:
-        try:
-            got = 0
-            for cfg in cfgs:
+        got = 0
+        errs = []
+        for cfg in cfgs:
+            try:
                 while True:
                     recs = fetch_queue(cfg, args.batch)
                     if not recs:
@@ -296,33 +299,36 @@ def cmd_collect(args) -> None:
                         ) from exc
                     if len(recs) < args.batch:
                         break
-            total += got
-            if got and args.verbose:
-                log(f"stored {got} records (total {total})")
+            except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+                msg = str(getattr(exc, "reason", exc))
+                if isinstance(exc, urllib.error.HTTPError):
+                    msg = f"HTTP {exc.code} from usage queue"
+                    if exc.code in (401, 403):
+                        msg += " (management key rejected)"
+                    elif exc.code == 404:
+                        msg += " (management API disabled? set management.secret-key)"
+                errs.append(f"{instance_tag(cfg.url)}: {msg}")
+        total += got
+        if got and args.verbose:
+            log(f"stored {got} records (total {total})")
+        try:
             with conn:
                 meta_set(conn, "collector_heartbeat", time.time())
-                meta_set(conn, "collector_last_error", "")
+                meta_set(conn, "collector_last_error",
+                         f"{time.time()}|{errs[0]}" if errs else "")
+        except sqlite3.Error:
+            pass
+        if errs:
+            msg = "; ".join(errs)
+            if msg != last_error:
+                log(f"error: {msg}")
+            last_error = msg
+            backoff = min(max(backoff * 2, args.interval), 30)
+        else:
             if last_error:
                 log("recovered")
                 last_error = None
             backoff = args.interval
-        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
-            msg = str(getattr(exc, "reason", exc))
-            if isinstance(exc, urllib.error.HTTPError):
-                msg = f"HTTP {exc.code} from usage queue"
-                if exc.code in (401, 403):
-                    msg += " (management key rejected)"
-                elif exc.code == 404:
-                    msg += " (management API disabled? set management.secret-key)"
-            if msg != last_error:
-                log(f"error: {msg}")
-            last_error = msg
-            try:
-                with conn:
-                    meta_set(conn, "collector_last_error", f"{time.time()}|{msg}")
-            except sqlite3.Error:
-                pass
-            backoff = min(max(backoff * 2, args.interval), 30)
         if quota_every and time.time() - last_quota >= quota_every:
             try:
                 now = time.time()

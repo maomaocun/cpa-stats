@@ -430,7 +430,7 @@ class TestRecoveryStats:
 
         rows = [mk(0, True), mk(30, False), mk(60, True), mk(400, False)]
         med, share = recovery_stats(rows)
-        assert med == 30 or med == 340  # deltas [30, 340], midpoint element
+        assert med == 185              # interpolated median of [30, 340]
         assert share == 0.5
 
     def test_none_when_clean(self):

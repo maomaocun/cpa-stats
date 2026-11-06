@@ -441,19 +441,19 @@ _CLAUDE_STATUS_KEYS = ("anthropic-ratelimit-unified-status",
 
 def _codex_window_reset(sig: dict, prefix: str, used: set, base: float):
     """reset-at epoch, else observed + reset-after-seconds."""
-    key = f"{prefix}reset-at"
-    if key in sig:
-        used.add(key)
-        t = _parse_epoch(sig[key])
-        if t:
-            return t
-    key = f"{prefix}reset-after-seconds"
-    if key in sig:
-        used.add(key)
-        secs = _parse_float(sig[key])
-        if secs is not None:
-            return base + secs
-    return None
+    key_at = f"{prefix}reset-at"
+    key_after = f"{prefix}reset-after-seconds"
+    t = None
+    if key_at in sig:
+        used.add(key_at)
+        t = _parse_epoch(sig[key_at])
+    if key_after in sig:
+        used.add(key_after)
+        if t is None:
+            secs = _parse_float(sig[key_after])
+            if secs is not None:
+                t = base + secs
+    return t
 
 
 def _normalize_codex(c: "CredInfo", sig: dict, used: set, base: float) -> None:
@@ -550,6 +550,8 @@ def _normalize_codex(c: "CredInfo", sig: dict, used: set, base: float) -> None:
             over = _parse_float(w.get("over-secondary-limit-percent"))
             if over is not None:
                 item[tag]["over_pct"] = over
+        if not item.get("short") and not item.get("long") and not item.get("limited"):
+            continue                # limit-name only, no window data — noise
         c.limits.append(item)
 
 
@@ -806,8 +808,7 @@ def recovery_stats(rows, within_s: float = 300.0):
             deltas.append(oks[i] - r["ts"])
     if not deltas:
         return None
-    deltas.sort()
-    med = deltas[len(deltas) // 2]
+    med = pct(deltas, 0.5)
     share = sum(1 for d in deltas if d <= within_s) / len(deltas)
     return med, share
 
