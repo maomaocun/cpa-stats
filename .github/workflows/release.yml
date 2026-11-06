@@ -59,7 +59,7 @@ jobs:
                                            # old runner predates PEP 660
           $PY -m PyInstaller --onefile --name cpa-stats \
             --collect-all textual --collect-all rich \
-            --copy-metadata cpa-stats cpa_stats_entry.py
+            cpa_stats_entry.py
           ./dist/cpa-stats --version
           mv dist/cpa-stats cpa-stats-${{ matrix.name }}
       - uses: actions/upload-artifact@v4
