@@ -10,9 +10,9 @@ database, so any number of viewers can run at the same time.
 
 ```
 CPA (127.0.0.1:PORT)
-   │  every 2 s, ≤ 500 records per poll
+   │  every 2 s, ≤ 500 records per poll; credentials/quota snapshot every 60 s
    ▼
-cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / export
+cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota / export
 ```
 
 ## Install
@@ -31,7 +31,9 @@ cpa-stats collect &                       # start the collector
 cpa-stats                                 # live dashboard (default 1h window)
 cpa-stats tui                             # interactive TUI (keys/mouse)
 cpa-stats -w 15m -m swe-2                 # filter window + model
-cpa-stats tail                            # one line per request, live
+cpa-stats tail                            # one line per request, live (-v: full routing detail)
+cpa-stats show <id>                       # every captured field of one request (--raw for JSON)
+cpa-stats quota                           # credential quota / cooldown snapshot
 cpa-stats summary --since 7d --by model   # aggregate report
 cpa-stats export --since 7d -o out.csv    # CSV / JSONL export
 cpa-stats prune --older-than 30d          # drop old records
@@ -45,17 +47,18 @@ Interactive dashboard (textual). Same data as `watch`, but navigable:
 |-|-|
 | `1` `2` `3` `4` | switch window: 15 m / 1 h / 6 h / 24 h |
 | `↑` `↓` / wheel / click | select a row in the focused table |
-| `←` `→` | cycle right-hand tabs (recent · sessions · totals) |
+| `←` `→` | cycle right-hand tabs (recent · sessions · quota · totals) |
 | `tab` | cycle focus between panels |
-| `enter` | open the request-detail modal |
+| `enter` | open the request/credential detail modal |
 | `f` | toggle the model filter input |
 | `p` | pause / resume auto-refresh |
 | `r` | force refresh |
 | `q` / `esc` | quit / close modal |
 
-Three tabs on the right: **recent** (every request, selectable → detail),
-**sessions** (top sessions by tokens), **totals** (all-time rollup + data
-quality).
+Four tabs on the right: **recent** (every request, selectable → detail),
+**sessions** (top sessions by tokens), **quota** (per-credential quota signals,
+selectable → full cooldown/signal detail), **totals** (all-time rollup + data
+quality). The statusbar shows the lowest remaining quota across credentials.
 
 ## Dashboard
 
@@ -66,6 +69,7 @@ cpa-stats   window 1h                                    ● collector live  200
 ╭─ requests · 1h ───────╮ ╭─ TTFT p50 ──────────╮ ╭─ TPS p50 decode/e2e ╮ ╭─ latency p50 ───────
 │        1219           │ │        784ms        │ │   103 / 64 tok/s    │ │        1.86s
 activity ▁▁▁▄▃▂▂▁▃▁▁▁▅█▁▁▁▁▁▁▁▁▁▁  1219 req · peak 308/2min bucket
+accounts · quota                                        ← per-credential daily/weekly %, resets, cooldowns
 per model · per session · recent requests
 ```
 
@@ -93,6 +97,17 @@ per model · per session · recent requests
 | cost | (new·P_in + c.read·P_cached + out·P_out) / 1e6 | only shown with `--price` |
 | reasoning | from upstream when reported | Devin does not report it (counted inside `out`) |
 
+## Quota
+
+The collector also snapshots `GET /v8/management/credentials` (fallback
+`/v0/management/auth-files`) every `--quota-interval` seconds (default 60; `0`
+disables) and stores the result in the db — every viewer reads it locally, no
+extra management calls. `cpa-stats quota`, the `watch` dashboard, and the TUI
+**quota** tab show per-credential: plan, daily/weekly quota remaining %, reset
+countdowns, ok/fail request counts, status (`active` / `error` / `blocked`),
+cooldowns, per-model quotas, and any other provider signals (e.g.
+`x-codex-*`, `anthropic-ratelimit-*` for Codex/Claude credentials).
+
 ## Collector
 
 The usage queue is destructive — exactly one reader is allowed, so `collect`
@@ -101,6 +116,7 @@ must be a singleton.
 ```bash
 cpa-stats collect                       # foreground
 cpa-stats collect --retention-days 30   # auto-prune, checked hourly
+cpa-stats collect --quota-interval 30   # credentials/quota snapshot every 30 s
 cpa-stats install-service               # write + enable a systemd --user unit
 ```
 
@@ -115,7 +131,8 @@ and `management.key` next to it. Override with `CPA_URL`, `CPA_MGMT_KEY`,
 ## Database
 
 `~/.local/share/cpa-stats/requests.db`, mode 600, WAL. Schema is versioned
-(`meta.schema_version`); `open_db` runs pending migrations automatically.
+(`meta.schema_version`); `open_db` runs pending migrations automatically. The
+latest credentials/quota snapshot lives in `meta.credentials_snapshot`.
 Sensitive record fields (`api_key`, `response_headers`, `access_token_sha256`)
 are dropped before storage.
 

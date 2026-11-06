@@ -25,6 +25,10 @@ Metrics
               (vs. inconsistent/partial) — a data-trust indicator.
   reasoning   shown only when the upstream reports it; Devin does not (it is
               counted inside output tokens)
+  quota       per-credential plan/quota signals from /management/credentials
+              (Devin: daily & weekly remaining % + reset times; Codex/Claude:
+              raw rate-limit header signals). Snapshotted by the collector into
+              the db so viewers never hit the management API themselves.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"

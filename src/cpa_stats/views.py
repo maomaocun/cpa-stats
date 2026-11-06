@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from pathlib import Path
 
-from .format import (fmt_age, fmt_cost, fmt_ms, fmt_pct, fmt_tok, fmt_tps,
-                     sparkline, window_label)
+from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
+                     fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
-                    bucket_counts, decode_tps, e2e_tps, group_by, short_model,
-                    token_parts)
-from .storage import db_totals, load_rows, meta_get
+                    bucket_counts, decode_tps, e2e_tps, field, group_by,
+                    parse_credentials, parse_iso_ts, request_detail_pairs,
+                    short_endpoint, short_model, token_parts)
+from .storage import db_totals, load_quota_snapshot, load_rows, meta_get
 
 try:
     from rich import box
@@ -63,8 +63,28 @@ def hit_style(ratio):
     return "red"
 
 
+def quota_style(pct):
+    if pct is None:
+        return "dim"
+    if pct >= 50:
+        return "green"
+    if pct >= 20:
+        return "yellow"
+    return "bold red"
+
+
 def styled(text, style):
     return Text(text, style=style)
+
+
+def _reset_str(ts):
+    """Quota reset instant -> 'in 2d3h' (or the date when already past)."""
+    if not ts:
+        return "—"
+    delta = ts - time.time()
+    if delta > 0:
+        return f"in {fmt_countdown(delta)}"
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
 
 def collector_status(conn):
@@ -178,6 +198,49 @@ def build_activity(rows, window_s: float, buckets: int = 24):
     return line
 
 
+def build_quota_table(creds, fetched_at=None):
+    """Per-credential quota / status table (accounts · quota)."""
+    title = "accounts · quota"
+    if fetched_at:
+        title += f" · snapshot {fmt_age(time.time() - fetched_at)}"
+    t = Table(box=box.SIMPLE_HEAD, expand=True, title=title,
+              title_style="bold cyan", title_justify="left")
+    t.add_column("account", style="bold", no_wrap=True)
+    t.add_column("status", no_wrap=True)
+    t.add_column("ok/fail", justify="right")
+    t.add_column("plan", style="dim")
+    t.add_column("daily", justify="right")
+    t.add_column("weekly", justify="right")
+    t.add_column("reset d·w", no_wrap=True)
+    t.add_column("signals", overflow="ellipsis", style="dim")
+    from rich.markup import escape
+    for c in creds:
+        ok_state = c.status == "active" and not c.blocked
+        status_style = "green" if ok_state else ("red" if c.blocked
+                                                 or c.status in ("error", "disabled") else "yellow")
+        status_txt = c.status + (" · blocked" if c.blocked else "")
+        resets = f"{_reset_str(c.daily_reset)} / {_reset_str(c.weekly_reset)}"
+        extra = " ".join(f"{escape(str(k))}={escape(str(v))}"
+                         for k, v in list((c.extra or {}).items())[:8]) or "—"
+        fail_cell = styled(str(c.fail), "red" if c.fail else "dim")
+        t.add_row(
+            Text.assemble(escape(c.account),
+                          (f" · {c.provider}", "dim") if c.provider else ""),
+            styled(status_txt, status_style),
+            Text.assemble(str(c.ok), "/", fail_cell),
+            escape(c.plan) if c.plan else "—",
+            styled(f"{c.daily_pct}%", quota_style(c.daily_pct))
+            if c.daily_pct is not None else "—",
+            styled(f"{c.weekly_pct}%", quota_style(c.weekly_pct))
+            if c.weekly_pct is not None else "—",
+            resets if resets != "— / —" else "—",
+            extra,
+        )
+    if not creds:
+        t.add_row(Text("no credentials in snapshot", style="dim"))
+    return t
+
+
 def show_reasoning(rows) -> bool:
     return any((r["reasoning_tokens"] or 0) > 0 for r in rows)
 
@@ -262,6 +325,7 @@ def build_recent_table(rows, limit):
               title_justify="left")
     t.add_column("time", style="dim", no_wrap=True)
     t.add_column("model", no_wrap=True)
+    t.add_column("endpoint", style="dim", no_wrap=True)
     t.add_column("effort", style="dim")
     t.add_column("in", justify="right")
     t.add_column("new", justify="right")
@@ -290,6 +354,7 @@ def build_recent_table(rows, limit):
         t.add_row(
             datetime.fromtimestamp(r["ts"]).strftime("%H:%M:%S"),
             short_model(r),
+            short_endpoint(field(r, "endpoint")),
             r["effort"] or "",
             fmt_tok(total),
             fmt_tok(uncached),
@@ -318,6 +383,8 @@ def render_dashboard(conn, args, console):
     status, _ = collector_status(conn)
     totals = db_totals(conn, pricing)
     total = totals.n
+    snap = load_quota_snapshot(conn)
+    creds = parse_credentials(snap)
     header = Table.grid(expand=True)
     header.add_column()
     header.add_column(justify="right")
@@ -336,7 +403,9 @@ def render_dashboard(conn, args, console):
     height = console.size.height
     # Fixed overhead: header + totals row + window rows + tokens row + activity
     # line + session table + footer ≈ 38 lines; per-model table adds up to 6.
-    recent_limit = args.limit or max(5, height - 38 - min(len(group_by(rows, short_model)), 6))
+    quota_lines = len(creds) + 2 if creds else 1
+    recent_limit = args.limit or max(5, height - 38 - quota_lines
+                                   - min(len(group_by(rows, short_model)), 6))
     footer = Text(
         "TTFT = time to first token · TPS = out / (latency − TTFT) · e2e = out / latency · "
         f"burst = upstream sent everything within {MIN_DECODE_MS}ms (Devin buffers tool calls)\n"
@@ -352,6 +421,12 @@ def render_dashboard(conn, args, console):
     act = build_activity(rows, window_s)
     if act is not None:
         parts.append(act)
+    if creds:
+        parts.append(build_quota_table(creds, (snap or {}).get("fetched_at")))
+    else:
+        parts.append(Text("quota: no credentials snapshot yet — restart "
+                          "`cpa-stats collect` to populate (every --quota-interval s)",
+                          style="dim"))
     parts += [build_model_table(rows, window_s), build_session_table(rows),
               build_recent_table(rows, recent_limit), footer]
     return Group(*parts)
@@ -403,6 +478,12 @@ def cmd_tail(args) -> None:
                 else:
                     line.append("✓ ", style="green")
                 line.append(f"{short_model(r):<18}", style="bold")
+                ep = short_endpoint(field(r, "endpoint"))
+                if ep:
+                    line.append(f"{ep:<12}", style="dim")
+                resp = field(r, "response_model")
+                if resp and resp != r["model"] and resp != r["alias"]:
+                    line.append(f"→{resp} ", style="dim")
                 line.append(f"{(r['effort'] or ''):<7}", style="dim")
                 line.append(f" in {fmt_tok(total):>6}")
                 line.append(
@@ -419,9 +500,41 @@ def cmd_tail(args) -> None:
                 e2e = None if r["failed"] else e2e_tps(r["output_tokens"], r["latency_ms"])
                 line.append("  e2e ")
                 line.append(f"{fmt_tps(e2e):>4}", style=tps_style(e2e))
+                if r["session_id"]:
+                    line.append(f"  sess {r['session_id'][-8:]}", style="dim")
                 if r["failed"] and r["error"]:
-                    line.append(f"  {r['status_code']}: {r['error'][:120]}", style="red")
+                    code = f" ({field(r, 'fail_code')})" if field(r, "fail_code") else ""
+                    line.append(f"  {r['status_code']}{code}: {r['error'][:120]}",
+                                style="red")
                 console.print(line, soft_wrap=True)
+                if args.verbose:
+                    det = Text("      ", style="dim")
+                    det.append(f"acct {r['source'] or '—'} "
+                               f"· auth {field(r, 'auth_type') or '—'}"
+                               f" via {field(r, 'access_provider') or '—'}"
+                               f" · endpoint {r['endpoint'] or '—'}")
+                    node_bits = [field(r, "node_kind"),
+                                 "fork" if field(r, "is_fork") else None,
+                                 "compaction" if field(r, "is_compaction") else None]
+                    node = "/".join(b for b in node_bits if b)
+                    if node:
+                        det.append(f" · node {node}")
+                    if field(r, "parent_session_id"):
+                        det.append(f" · parent {field(r, 'parent_session_id')}")
+                    tiers = [r["service_tier"],
+                             field(r, "effective_service_tier"),
+                             field(r, "response_service_tier"),
+                             field(r, "upstream_service_tier")]
+                    if any(tiers):
+                        det.append(f" · tier {'→'.join(t or '—' for t in tiers)}")
+                    det.append(f" · exec {r['id'][:12]}"
+                               f" · trace {field(r, 'trace_id') or '—'}")
+                    if field(r, "client_ip"):
+                        det.append(f" · ip {field(r, 'client_ip')}")
+                    if field(r, "speed") or field(r, "inference_geo"):
+                        det.append(f" · {field(r, 'speed') or '—'}"
+                                   f"/{field(r, 'inference_geo') or '—'}")
+                    console.print(det, soft_wrap=True)
             if len(seen) > 5000 and rows:
                 seen = {r["id"] for r in rows}
             time.sleep(args.refresh)
@@ -444,6 +557,10 @@ def cmd_summary(args) -> None:
         "session": lambda r: (r["session_id"] or "—"),
         "account": lambda r: (r["source"] or r["auth_index"] or "—"),
         "effort": lambda r: f"{short_model(r)} · {r['effort'] or '—'}",
+        "endpoint": lambda r: (r["endpoint"] or "—"),
+        "provider": lambda r: (r["provider"] or "—"),
+        "upstream": lambda r: (r["response_model"] or "—"),
+        "node_kind": lambda r: (field(r, "node_kind") or "—"),
         "hour": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:00"),
         "day": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d"),
     }[args.by]
@@ -495,3 +612,100 @@ def cmd_summary(args) -> None:
             ft.add_row(datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M:%S"), short_model(r),
                        str(r["status_code"] or ""), (r["error"] or "")[:300])
         console.print(ft)
+    snap = load_quota_snapshot(conn)
+    creds = parse_credentials(snap)
+    if creds:
+        console.print(build_quota_table(creds, snap.get("fetched_at")))
+
+
+def cmd_quota(args) -> None:
+    """`cpa-stats quota` — full credential snapshot: quota, cooldowns, signals."""
+    need_rich()
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    snap = load_quota_snapshot(conn)
+    console = Console()
+    if not snap or not isinstance(snap.get("files"), list):
+        console.print(Text(
+            "no credential snapshot yet — restart `cpa-stats collect` "
+            "(it stores /management/credentials every --quota-interval seconds)",
+            style="dim"))
+        return
+    creds = parse_credentials(snap)
+    fetched = snap.get("fetched_at")
+    console.print(Text(
+        f"cpa-stats quota · {len(creds)} credential(s)"
+        + (f" · snapshot {fmt_age(time.time() - fetched)}" if fetched else ""),
+        style="bold cyan"))
+    console.print(build_quota_table(creds, fetched))
+    from rich.markup import escape
+    for c in creds:
+        lines = []
+        if c.status_message:
+            lines.append(f"[red]status[/]      {escape(c.status_message)}")
+        for k in sorted(c.signals or {}):
+            lines.append(f"[dim]signal[/]      {escape(str(k))} = {escape(str(c.signals[k]))}")
+        for cd in c.cooldowns or []:
+            if not isinstance(cd, dict):
+                continue
+            scope = cd.get("scope") or ""
+            mk = cd.get("model_key") or ""
+            retry = parse_iso_ts(cd.get("retry_at"))
+            rem = cd.get("remaining_seconds")
+            lines.append(
+                f"[yellow]cooldown[/]   {escape(scope)}"
+                + (f"/{escape(str(mk))}" if mk else "")
+                + f" · {escape(str(cd.get('reason') or ''))}"
+                + (f" · retry {datetime.fromtimestamp(retry).strftime('%m-%d %H:%M')}"
+                   f" (in {fmt_countdown(retry - time.time())})" if retry else "")
+                + (f" · remaining {fmt_countdown(rem)}" if rem else ""))
+        for model_name, q in sorted((c.model_quotas or {}).items()):
+            sig = q.get("signals") if isinstance(q, dict) else {}
+            rendered = " ".join(f"{escape(str(k))}={escape(str(v))}"
+                                for k, v in sorted((sig or {}).items())) or "—"
+            lines.append(f"[dim]model[/]       {escape(str(model_name))}: {rendered}")
+        if c.observed_at:
+            lines.append(f"[dim]observed[/]    {escape(c.observed_at)}")
+        if lines:
+            body = "\n".join(lines)
+            console.print(Panel(body, title=f"[bold]{escape(c.account)}[/]",
+                                box=box.ROUNDED, padding=(0, 1)))
+
+
+def cmd_show(args) -> None:
+    """`cpa-stats show <id>` — every captured field of one request."""
+    need_rich()
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    console = Console()
+    rid = args.request_id
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
+    where = "id LIKE ? OR request_id LIKE ?"
+    params = [f"{rid}%", f"{rid}%"]
+    if "trace_id" in cols:
+        where += " OR trace_id LIKE ?"
+        params.append(f"{rid}%")
+    row = conn.execute(
+        f"SELECT * FROM requests WHERE {where} ORDER BY ts DESC LIMIT 1",
+        params).fetchone()
+    if not row:
+        console.print(Text(f"no request matching '{rid}'", style="red"))
+        raise SystemExit(1)
+    from rich.markup import escape
+
+    t = Table(box=box.SIMPLE_HEAD, show_header=False, title="request detail",
+              title_style="bold cyan", title_justify="left")
+    t.add_column("k", style="dim", justify="right", no_wrap=True)
+    t.add_column("v", overflow="fold")
+    for k, v in request_detail_pairs(row):
+        t.add_row(k, escape(str(v)))
+    console.print(t)
+    if args.raw:
+        raw = field(row, "raw")
+        if raw:
+            try:
+                console.print_json(raw)
+            except ValueError:
+                console.print(raw)

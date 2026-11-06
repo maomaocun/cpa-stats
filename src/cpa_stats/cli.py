@@ -52,7 +52,7 @@ def cmd_export(args) -> None:
             w = csv.DictWriter(out, fieldnames=fields)
             w.writeheader()
         for r in rows:
-            d = {c: r[c] for c in COLUMNS if c != "raw"}
+            d = {c: r[c] for c in COLUMNS if c != "raw" and c in r.keys()}
             total, uncached, read, _ = token_parts(r)
             d["prompt_tokens_total"], d["uncached_tokens"] = total, uncached
             d["cache_hit_ratio"] = round(read / total, 4) if total else None
@@ -135,6 +135,21 @@ def cmd_doctor(args) -> None:
                    f"{fmt_age(time.time() - last) if last else 'never'})")
         ver = meta_get(conn, "schema_version")
         line(True, f"schema version {ver or 'pre-v2'}")
+        snap = None
+        try:
+            from .storage import load_quota_snapshot
+
+            snap = load_quota_snapshot(conn)
+        except sqlite3.Error:
+            pass
+        if snap and isinstance(snap.get("files"), list):
+            age = time.time() - float(snap.get("fetched_at") or 0)
+            line(age < 3 * 3600,
+                 f"quota snapshot: {len(snap['files'])} credential(s), "
+                 f"{fmt_age(age)}")
+        else:
+            line(False, "no quota snapshot yet (restart collect ≥2.1; "
+                        "--quota-interval)")
         hb = meta_get(conn, "collector_heartbeat")
         age = time.time() - float(hb) if hb else None
         line(age is not None and age < 15, f"collector heartbeat {fmt_age(age)}")
@@ -211,7 +226,7 @@ def main(argv=None) -> None:
     p.add_argument("--version", action="version", version=f"cpa-stats {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
-    from .views import cmd_summary, cmd_tail, cmd_watch
+    from .views import cmd_quota, cmd_show, cmd_summary, cmd_tail, cmd_watch
 
     w = sub.add_parser("watch", parents=[common, filters], help="live dashboard (default)")
     w.add_argument("-w", "--window", type=parse_duration, default=parse_duration("1h"),
@@ -233,15 +248,31 @@ def main(argv=None) -> None:
     t.add_argument("--since", type=parse_duration, default=parse_duration("5m"),
                    help="backfill window (default 5m)")
     t.add_argument("-r", "--refresh", type=float, default=0.5)
+    t.add_argument("-v", "--verbose", action="store_true",
+                   help="print a second line per request: account, endpoint, "
+                        "tiers, node/fork/compaction, exec/trace ids, client ip")
     t.set_defaults(func=cmd_tail)
 
     s = sub.add_parser("summary", parents=[common, filters], help="aggregate report")
     s.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
                    help="window (default 24h)")
-    s.add_argument("--by", choices=["model", "effort", "session", "account", "hour", "day"],
+    s.add_argument("--by", choices=["model", "effort", "session", "account",
+                                    "endpoint", "provider", "upstream",
+                                    "node_kind", "hour", "day"],
                    default="model")
     add_price_arg(s)
     s.set_defaults(func=cmd_summary)
+
+    q = sub.add_parser("quota", parents=[common],
+                       help="credential quota/status snapshot collected from CPA")
+    q.set_defaults(func=cmd_quota)
+
+    sh = sub.add_parser("show", parents=[common],
+                        help="full detail for one request (id / request_id / trace_id prefix)")
+    sh.add_argument("request_id")
+    sh.add_argument("--raw", action="store_true",
+                    help="also dump the raw upstream record JSON")
+    sh.set_defaults(func=cmd_show)
 
     e = sub.add_parser("export", parents=[common, filters], help="export rows as csv / jsonl")
     e.add_argument("--since", type=parse_duration, default=parse_duration("24h"))
@@ -253,6 +284,9 @@ def main(argv=None) -> None:
                        help="drain CPA usage queue into the database (daemon)")
     c.add_argument("--interval", type=float, default=2.0, help="poll interval seconds")
     c.add_argument("--batch", type=int, default=500)
+    c.add_argument("--quota-interval", type=float, default=60.0,
+                   help="also snapshot /credentials quota+status every N seconds "
+                        "(0 = off)")
     c.add_argument("--retention-days", type=float, default=90,
                    help="delete records older than this, checked hourly (0 = keep forever)")
     c.add_argument("--once", action="store_true", help="drain once and exit")

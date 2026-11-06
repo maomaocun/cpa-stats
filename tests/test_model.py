@@ -1,8 +1,10 @@
 """Unit tests for pure metric/parsing functions."""
 
-from cpa_stats.model import (MIN_DECODE_MS, Pricing, decode_tps, e2e_tps,
-                             parse_pricing, parse_ts, pct, record_to_row,
-                             token_parts, token_quality)
+from cpa_stats.model import (COLUMNS, MIN_DECODE_MS, Pricing, decode_tps,
+                             e2e_tps, parse_credentials, parse_iso_ts,
+                             parse_pricing, parse_pct, parse_ts, pct,
+                             record_to_row, request_detail_pairs, token_parts,
+                             token_quality)
 
 
 def rec(**kw):
@@ -25,12 +27,7 @@ def rec(**kw):
 
 def row(**kw):
     cols = dict(zip(
-        ["id", "ts", "model", "alias", "response_model", "provider", "effort",
-         "service_tier", "endpoint", "source", "auth_index", "session_id",
-         "request_id", "user_agent", "stream", "failed", "status_code", "error",
-         "latency_ms", "ttft_ms", "input_tokens", "output_tokens",
-         "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
-         "token_quality", "raw"],
+        COLUMNS,
         record_to_row(rec(**kw))))
     return cols
 
@@ -126,6 +123,45 @@ class TestRecordToRow:
         assert r["cache_read_tokens"] == 30
         assert r["cache_write_tokens"] == 7
 
+    def test_v3_fields(self):
+        r = row(executor_type="DevinExecutor", auth_type="oauth",
+                access_provider="config-inline", is_native_key=True,
+                trace_id="tr-1", parent_session_id="ps-1", node_kind="main",
+                is_fork=True, is_compaction=False, client_ip="10.0.0.1",
+                resolved_client_ip="10.0.0.2", x_forwarded_for="1.2.3.4",
+                effective_service_tier="auto", response_service_tier="priority",
+                upstream_service_tier="auto", speed="fast", inference_geo="us",
+                generate=True,
+                tokens={"input_tokens": 100, "output_tokens": 10,
+                        "total_tokens": 110},
+                fail={"status_code": 429, "code": "rate_limit"})
+        assert r["executor_type"] == "DevinExecutor"
+        assert r["auth_type"] == "oauth"
+        assert r["access_provider"] == "config-inline"
+        assert r["is_native_key"] == 1
+        assert r["trace_id"] == "tr-1"
+        assert r["parent_session_id"] == "ps-1"
+        assert r["node_kind"] == "main"
+        assert r["is_fork"] == 1
+        assert r["is_compaction"] == 0
+        assert r["client_ip"] == "10.0.0.1"
+        assert r["x_forwarded_for"] == "1.2.3.4"
+        assert r["effective_service_tier"] == "auto"
+        assert r["response_service_tier"] == "priority"
+        assert r["upstream_service_tier"] == "auto"
+        assert r["speed"] == "fast"
+        assert r["inference_geo"] == "us"
+        assert r["fail_code"] == "rate_limit"
+        assert r["total_tokens"] == 110
+        assert r["generate"] == 1
+
+    def test_v3_fields_absent(self):
+        r = row()
+        assert r["executor_type"] is None
+        assert r["is_native_key"] is None
+        assert r["generate"] is None
+        assert r["total_tokens"] is None  # not summed when upstream omits it
+
 
 class TestTokenQuality:
     def test_from_breakdown(self):
@@ -163,3 +199,129 @@ class TestPricing:
             parse_pricing("1,2")
         with pytest.raises(ValueError):
             parse_pricing("a,b,c")
+
+
+class TestParsePct:
+    def test_values(self):
+        assert parse_pct("81%") == 81
+        assert parse_pct("0%") == 0
+        assert parse_pct("42") == 42
+        assert parse_pct(7) == 7
+        assert parse_pct(None) is None
+        assert parse_pct("abc") is None
+        assert parse_pct("") is None
+
+
+class TestParseIsoTs:
+    def test_ok(self):
+        assert parse_iso_ts("2026-11-08T08:00:00Z") > 0
+        assert parse_iso_ts("2026-11-05T15:22:56.911129228+08:00") > 0
+
+    def test_bad(self):
+        assert parse_iso_ts("") is None
+        assert parse_iso_ts(None) is None
+        assert parse_iso_ts("not a date") is None
+
+
+def cred_fixture(**kw):
+    base = {
+        "id": "devin-a.json", "name": "devin-a.json", "provider": "devin",
+        "label": "a@example.com", "status": "active", "disabled": False,
+        "unavailable": False, "success": 100, "failed": 2,
+        "email": "a@example.com",
+        "quota": {"observed_at": "2026-11-06T14:23:38+08:00",
+                  "signals": {
+                      "plan": "Max",
+                      "daily_quota_remaining_percent": "100%",
+                      "weekly_quota_remaining_percent": "81%",
+                      "daily_quota_reset_at": "2026-11-06T08:00:00Z",
+                      "weekly_quota_reset_at": "2026-11-08T08:00:00Z",
+                      "plan_end": "2026-12-03T03:27:33Z",
+                      "x-codex-plan-type": "max",
+                  }},
+    }
+    base.update(kw)
+    return base
+
+
+class TestParseCredentials:
+    def test_devin_fields(self):
+        creds = parse_credentials({"files": [cred_fixture()]})
+        assert len(creds) == 1
+        c = creds[0]
+        assert c.account == "a@example.com"
+        assert c.provider == "devin"
+        assert c.status == "active"
+        assert not c.blocked
+        assert c.ok == 100 and c.fail == 2
+        assert c.plan == "Max"
+        assert c.daily_pct == 100 and c.weekly_pct == 81
+        assert c.daily_reset and c.weekly_reset and c.plan_end
+        # non-Devin signals land in `extra`
+        assert c.extra == {"x-codex-plan-type": "max"}
+
+    def test_blocked_and_disabled(self):
+        c = parse_credentials({"files": [
+            cred_fixture(unavailable=True, quota_blocked=True, status="error"),
+            cred_fixture(id="b", name="b", disabled=True, email="", label=""),
+        ]})
+        assert c[0].blocked and c[0].status == "error"
+        assert c[1].status == "disabled"
+        assert c[1].account == "b"  # falls back to name when email is empty
+
+    def test_empty_and_list(self):
+        assert parse_credentials(None) == []
+        assert parse_credentials({}) == []
+        assert parse_credentials({"files": "nope"}) == []
+        assert len(parse_credentials([cred_fixture()])) == 1
+
+
+class TestDetailPairs:
+    def test_covers_v3_fields(self):
+        r = row(request_id="req-1", endpoint="POST /v1/responses",
+                executor_type="DevinExecutor", auth_type="oauth",
+                access_provider="config-inline", is_native_key=True,
+                trace_id="tr-9", session_id="sess-1", parent_session_id="ps-1",
+                node_kind="main", is_fork=True, client_ip="127.0.0.1",
+                service_tier="auto", response_service_tier="priority",
+                response_model="swe-2-max-lightning",
+                source="a@example.com", auth_index="abc",
+                user_agent="codex-tui/1.0",
+                tokens={"input_tokens": 100, "output_tokens": 10,
+                        "total_tokens": 110},
+                token_breakdown={"quality": "complete",
+                                 "total_tokens": 110,
+                                 "unclassified_tokens": 0,
+                                 "input": {"total_tokens": 100,
+                                          "uncached_tokens": 60,
+                                          "cache_read_tokens": 40,
+                                          "cache_write_tokens": 0},
+                                 "output": {"total_tokens": 10,
+                                            "non_reasoning_tokens": 10,
+                                            "reasoning_tokens": 0}})
+        pairs = dict(request_detail_pairs(r))
+        assert "DevinExecutor" in pairs["provider / executor"]
+        assert "swe-2-max-lightning" in pairs["model"]
+        assert pairs["endpoint"] == "POST /v1/responses"
+        assert "auto" in pairs["tier req→eff→resp→up"]
+        assert "priority" in pairs["tier req→eff→resp→up"]
+        assert "sess-1" in pairs["session"] and "ps-1" in pairs["session"]
+        assert "fork" in pairs["node"]
+        assert "req-1" in pairs["request / exec / trace"]
+        assert "tr-9" in pairs["request / exec / trace"]
+        assert "a@example.com" in pairs["account"]
+        assert "127.0.0.1" in pairs["client ip / resolved / xff"]
+        assert "codex-tui" in pairs["client"]
+        assert "native yes" in pairs["access"]
+        assert pairs["token quality"] == "complete"
+        assert "110" in pairs["total tokens"]
+
+    def test_raw_only_extras(self):
+        r = row(iterations=[{"type": "model", "model": "swe-2",
+                             "input_tokens": 10, "output_tokens": 5}],
+                tool_usage_details={"web_search_calls": 2, "mcp_calls": 1},
+                cost_details={"cost": 0.0123})
+        pairs = dict(request_detail_pairs(r))
+        assert "swe-2" in pairs["iterations [1]"]
+        assert "web_search_calls 2" in pairs["server tools"]
+        assert "$0.012" in pairs["upstream cost"]

@@ -1,12 +1,14 @@
 """Storage tests: schema, migrations, totals, dedup."""
 
+import json
 import sqlite3
 
 import pytest
 
 from cpa_stats.model import aggregate, parse_pricing, record_to_row
 from cpa_stats.storage import (SCHEMA_VERSION, db_totals, insert_records,
-                               load_rows, meta_get, open_db, prune)
+                               load_quota_snapshot, load_rows, meta_get,
+                               open_db, prune, save_quota_snapshot)
 
 
 def rec(i, **kw):
@@ -71,6 +73,81 @@ class TestMigration:
         q = conn2.execute("SELECT token_quality FROM requests WHERE id='r1'").fetchone()[0]
         assert q == "inconsistent"
         assert meta_get(conn2, "schema_version") == str(SCHEMA_VERSION)
+
+    def test_v2_db_upgraded(self, tmp_path):
+        """v2 -> v3: new columns added and backfilled from raw JSON."""
+        path = tmp_path / "v2.db"
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            """CREATE TABLE requests (id TEXT PRIMARY KEY, ts REAL, model TEXT,
+            alias TEXT, response_model TEXT, provider TEXT, effort TEXT,
+            service_tier TEXT, endpoint TEXT, source TEXT, auth_index TEXT,
+            session_id TEXT, request_id TEXT, user_agent TEXT, stream INTEGER,
+            failed INTEGER, status_code INTEGER, error TEXT, latency_ms INTEGER,
+            ttft_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+            reasoning_tokens INTEGER, cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER, token_quality TEXT, raw TEXT)""")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','2')")
+        raw = {"executor_type": "DevinExecutor", "auth_type": "oauth",
+               "trace_id": "tr-7", "is_native_key": True, "node_kind": "main",
+               "is_fork": True, "client_ip": "127.0.0.1",
+               "upstream_service_tier": "auto", "speed": "fast",
+               "generate": True,
+               "tokens": {"total_tokens": 76688},
+               "fail": {"status_code": 200, "code": ""}}
+        conn.execute(
+            "INSERT INTO requests(id, ts, failed, raw) VALUES(?,?,?,?)",
+            ("r1", 1793620538.0, 0, json.dumps(raw)))
+        conn.commit()
+        conn.close()
+
+        conn2 = open_db(path)
+        conn2.row_factory = sqlite3.Row
+        cols = {r["name"] for r in conn2.execute("PRAGMA table_info(requests)")}
+        for c in ("executor_type", "auth_type", "access_provider",
+                  "is_native_key", "trace_id", "parent_session_id", "node_kind",
+                  "is_fork", "is_compaction", "client_ip", "resolved_client_ip",
+                  "x_forwarded_for", "effective_service_tier",
+                  "response_service_tier", "upstream_service_tier", "speed",
+                  "inference_geo", "fail_code", "total_tokens", "generate"):
+            assert c in cols
+        row = conn2.execute("SELECT * FROM requests WHERE id='r1'").fetchone()
+        assert row["executor_type"] == "DevinExecutor"
+        assert row["auth_type"] == "oauth"
+        assert row["trace_id"] == "tr-7"
+        assert row["is_native_key"] == 1
+        assert row["is_fork"] == 1
+        assert row["is_compaction"] is None
+        assert row["client_ip"] == "127.0.0.1"
+        assert row["upstream_service_tier"] == "auto"
+        assert row["speed"] == "fast"
+        assert row["total_tokens"] == 76688
+        assert row["generate"] == 1
+        assert row["fail_code"] is None  # empty code -> NULL
+        assert meta_get(conn2, "schema_version") == str(SCHEMA_VERSION)
+
+
+class TestQuotaSnapshot:
+    def test_roundtrip(self, db):
+        snap = {"fetched_at": 1793947000.0, "observed_at": "2026-11-06T14:23:38+08:00",
+                "files": [{"name": "a.json", "provider": "devin",
+                           "quota": {"signals": {"plan": "Max",
+                                                 "weekly_quota_remaining_percent": "81%"}}}]}
+        save_quota_snapshot(db, snap)
+        db.commit()
+        got = load_quota_snapshot(db)
+        assert got["files"][0]["quota"]["signals"]["plan"] == "Max"
+        assert got["fetched_at"] == 1793947000.0
+
+    def test_missing(self, db):
+        assert load_quota_snapshot(db) is None
+
+    def test_corrupt(self, db):
+        from cpa_stats.storage import meta_set
+        meta_set(db, "credentials_snapshot", "{not json")
+        db.commit()
+        assert load_quota_snapshot(db) is None
 
 
 class TestInsert:

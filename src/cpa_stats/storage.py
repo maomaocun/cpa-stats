@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
 from .model import INSERT_SQL, Agg
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -38,7 +40,27 @@ CREATE TABLE IF NOT EXISTS requests (
     cache_read_tokens  INTEGER,
     cache_write_tokens INTEGER,
     token_quality      TEXT,
-    raw                TEXT
+    raw                TEXT,
+    executor_type          TEXT,
+    auth_type              TEXT,
+    access_provider        TEXT,
+    is_native_key          INTEGER,
+    trace_id               TEXT,
+    parent_session_id      TEXT,
+    node_kind              TEXT,
+    is_fork                INTEGER,
+    is_compaction          INTEGER,
+    client_ip              TEXT,
+    resolved_client_ip     TEXT,
+    x_forwarded_for        TEXT,
+    effective_service_tier TEXT,
+    response_service_tier  TEXT,
+    upstream_service_tier  TEXT,
+    speed                  TEXT,
+    inference_geo          TEXT,
+    fail_code              TEXT,
+    total_tokens           INTEGER,
+    generate               INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_model_ts ON requests(model, ts);
@@ -46,15 +68,52 @@ CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
-# version -> list of statements applied when upgrading FROM that version.
-MIGRATIONS = {
-    1: [
-        "ALTER TABLE requests ADD COLUMN token_quality TEXT",
-        # Backfill from the raw JSON so pre-v2 rows keep their quality flag.
-        "UPDATE requests SET token_quality = json_extract(raw, '$.token_breakdown.quality') "
-        "WHERE token_quality IS NULL",
-    ],
+# v3 columns -> path inside the raw JSON record, used for the backfill.
+_V3_JSON_PATHS = {
+    "executor_type": "executor_type",
+    "auth_type": "auth_type",
+    "access_provider": "access_provider",
+    "is_native_key": "is_native_key",
+    "trace_id": "trace_id",
+    "parent_session_id": "parent_session_id",
+    "node_kind": "node_kind",
+    "is_fork": "is_fork",
+    "is_compaction": "is_compaction",
+    "client_ip": "client_ip",
+    "resolved_client_ip": "resolved_client_ip",
+    "x_forwarded_for": "x_forwarded_for",
+    "effective_service_tier": "effective_service_tier",
+    "response_service_tier": "response_service_tier",
+    "upstream_service_tier": "upstream_service_tier",
+    "speed": "speed",
+    "inference_geo": "inference_geo",
+    "fail_code": "fail.code",
+    "total_tokens": "tokens.total_tokens",
+    "generate": "generate",
 }
+
+_V3_COLUMN_TYPES = {
+    "is_native_key": "INTEGER", "is_fork": "INTEGER", "is_compaction": "INTEGER",
+    "total_tokens": "INTEGER", "generate": "INTEGER",
+}
+
+# version -> list of statements applied when upgrading FROM that version.
+MIGRATIONS = {}
+MIGRATIONS[1] = [
+    "ALTER TABLE requests ADD COLUMN token_quality TEXT",
+    # Backfill from the raw JSON so pre-v2 rows keep their quality flag.
+    "UPDATE requests SET token_quality = json_extract(raw, '$.token_breakdown.quality') "
+    "WHERE token_quality IS NULL",
+]
+MIGRATIONS[2] = [
+    f"ALTER TABLE requests ADD COLUMN {col} {_V3_COLUMN_TYPES.get(col, 'TEXT')}"
+    for col in _V3_JSON_PATHS
+] + [
+    "UPDATE requests SET "
+    + ", ".join(f"{col} = NULLIF(json_extract(raw, '$.{path}'), '')"
+                for col, path in _V3_JSON_PATHS.items())
+    + " WHERE json_valid(raw)"
+]
 
 
 def open_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -98,7 +157,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
     while version < SCHEMA_VERSION:
         for sql in MIGRATIONS.get(version, []):
-            if sql.startswith("ALTER TABLE") and "token_quality" in sql and "token_quality" in cols:
+            m = re.match(r"ALTER TABLE requests ADD COLUMN (\w+)", sql)
+            if m and m.group(1) in cols:
                 continue  # column already exists
             conn.execute(sql)
         version += 1
@@ -118,6 +178,22 @@ def meta_set(conn, key, value):
         "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, str(value)),
     )
+
+
+def save_quota_snapshot(conn, snap: dict) -> None:
+    """Persist the latest /credentials payload (quota signals, status)."""
+    meta_set(conn, "credentials_snapshot", json.dumps(snap, ensure_ascii=False, default=str))
+
+
+def load_quota_snapshot(conn) -> dict | None:
+    raw = meta_get(conn, "credentials_snapshot")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else {"files": data}
 
 
 def load_rows(conn, since_ts: float, model: str | None = None, session: str | None = None, limit=None):

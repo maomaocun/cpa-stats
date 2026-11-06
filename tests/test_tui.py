@@ -39,6 +39,26 @@ def db(tmp_path):
     return path
 
 
+@pytest.fixture
+def db_with_quota(tmp_path):
+    from cpa_stats.storage import save_quota_snapshot
+
+    conn = open_db(tmp_path / "r.db")
+    insert_records(conn, [make_rec(i) for i in range(5)])
+    save_quota_snapshot(conn, {
+        "fetched_at": time.time(),
+        "files": [{"name": "devin-a.json", "provider": "devin",
+                   "status": "active", "success": 10, "failed": 1,
+                   "email": "a@example.com",
+                   "quota": {"signals": {
+                       "plan": "Max",
+                       "daily_quota_remaining_percent": "100%",
+                       "weekly_quota_remaining_percent": "81%"}}}]})
+    conn.commit()
+    conn.close()
+    return tmp_path / "r.db"
+
+
 @pytest.mark.asyncio
 async def test_app_starts_and_renders(db):
     AppCls = build_app()
@@ -80,3 +100,23 @@ async def test_window_and_pause(db):
         await pilot.press("p")
         await pilot.pause()
         assert not app.paused
+
+
+@pytest.mark.asyncio
+async def test_quota_tab(db_with_quota):
+    AppCls = build_app()
+    app = AppCls(str(db_with_quota))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        qt = app.query_one("#quota-table")
+        assert qt.row_count == 1
+        # statusbar shows the quota chip
+        sb = app.query_one("#statusbar")
+        assert "w81%" in str(sb.render())
+        # open credential detail via enter on the quota table
+        qt.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()

@@ -60,6 +60,22 @@ def fmt_age(seconds):
     return f"{seconds / 86400:.1f}d ago"
 
 
+def fmt_countdown(seconds):
+    """Compact '2d3h' / '45m' countdown for a future instant."""
+    if seconds is None or seconds <= 0:
+        return "due"
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{mins}m"
+    if mins:
+        return f"{mins}m"
+    return f"{secs}s"
+
+
 def window_label(seconds: float) -> str:
     for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
         if seconds >= size and seconds % size == 0:

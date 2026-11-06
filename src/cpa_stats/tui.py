@@ -9,9 +9,9 @@ Layout
 Keys
     1/2/3/4   window 15m / 1h / 6h / 24h
     up/down   select a row (mouse wheel scrolls; click selects)
-    left/right switch right-hand tabs (recent / sessions / totals)
+    left/right switch right-hand tabs (recent / sessions / quota / totals)
     tab       cycle focus between panels
-    enter     request detail modal
+    enter     detail modal (request or credential)
     f         filter (model substring)
     p         pause / resume refresh
     r         force refresh
@@ -24,11 +24,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .format import (fmt_age, fmt_cost, fmt_ms, fmt_pct, fmt_tok, fmt_tps,
-                     sparkline, window_label)
+from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
+                     fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
-                    decode_tps, e2e_tps, group_by, short_model, token_parts)
-from .storage import db_totals, load_rows, meta_get
+                    decode_tps, e2e_tps, field, group_by, parse_credentials,
+                    request_detail_pairs, short_endpoint, short_model,
+                    token_parts)
+from .storage import db_totals, load_quota_snapshot, load_rows, meta_get
 
 WINDOWS = {  # key -> seconds
     "1": ("15m", 15 * 60),
@@ -46,6 +48,7 @@ def build_app():
     from textual.screen import ModalScreen
     from textual.widgets import (DataTable, Footer, Header, Input, Static,
                                  TabbedContent, TabPane)
+    from rich.markup import escape
 
     class DetailScreen(ModalScreen):
         """Modal showing every field of one request row."""
@@ -58,39 +61,55 @@ def build_app():
 
         def compose(self):
             r = self.row
-            total, new, read, write = token_parts(r)
-            tps = decode_tps(r["output_tokens"], r["latency_ms"], r["ttft_ms"])
-            e2e = e2e_tps(r["output_tokens"], r["latency_ms"])
-            grid = [
-                ("time", datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M:%S")),
-                ("model", f"{short_model(r)}  (resp: {r['response_model'] or '—'})"),
-                ("provider / effort / tier",
-                 f"{r['provider'] or '—'} / {r['effort'] or '—'} / {r['service_tier'] or '—'}"),
-                ("endpoint", r["endpoint"] or "—"),
-                ("session", r["session_id"] or "—"),
-                ("request / execution", f"{r['request_id'] or '—'} / {r['id']}"),
-                ("account", r["source"] or r["auth_index"] or "—"),
-                ("client", r["user_agent"] or "—"),
-                ("status",
-                 f"{'✗ FAILED ' + str(r['status_code'] or '') if r['failed'] else '✓ ok'}"
-                 + (f"  stream={bool(r['stream'])}" if r["stream"] is not None else "")),
-                ("", ""),
-                ("latency / TTFT", f"{fmt_ms(r['latency_ms'])} / {fmt_ms(r['ttft_ms'])}"),
-                ("TPS decode / e2e", f"{fmt_tps(tps)} / {fmt_tps(e2e)} tok/s"),
-                ("input tokens", f"{fmt_tok(total)}  =  {fmt_tok(new)} new"
-                 f" + {fmt_tok(read)} read + {fmt_tok(write)} write"
-                 f"  (hit {fmt_pct(read / total if total else None)})"),
-                ("output", f"{fmt_tok(r['output_tokens'])}"
-                 + (f"  reasoning {fmt_tok(r['reasoning_tokens'])}" if r["reasoning_tokens"] else "")),
-                ("token quality", r["token_quality"] or "—"),
-            ]
-            if r["error"]:
-                grid.append(("error", r["error"][:400]))
+            grid = request_detail_pairs(r)
             text = "\n".join(
-                f"[dim]{k:>22}[/]  {v}" if k else "" for k, v in grid)
+                f"[dim]{k:>24}[/]  {escape(v)}" for k, v in grid)
             yield Vertical(
                 Static(f"[bold cyan]{short_model(r)}[/] · {r['id'][:12]}"),
                 Static(text),
+                Static("[dim]esc / enter to close[/]"),
+                id="detail",
+            )
+
+    class CredScreen(ModalScreen):
+        """Modal showing quota signals / cooldowns for one credential."""
+
+        BINDINGS = [Binding("escape,q,enter", "dismiss", "close")]
+
+        def __init__(self, cred):
+            super().__init__()
+            self.cred = cred
+
+        def compose(self):
+            c = self.cred
+            lines = []
+            state = c.status + (" · blocked" if c.blocked else "")
+            lines.append(f"[dim]{'status':>16}[/]  {escape(state)}")
+            if c.status_message:
+                lines.append(f"[dim]{'message':>16}[/]  [red]{escape(c.status_message)}[/]")
+            lines.append(f"[dim]{'requests':>16}[/]  {c.ok} ok · {c.fail} failed")
+            for k in sorted(c.signals or {}):
+                lines.append(f"[dim]{'signal':>16}[/]  {escape(str(k))} = {escape(str(c.signals[k]))}")
+            for cd in c.cooldowns or []:
+                if not isinstance(cd, dict):
+                    continue
+                scope = cd.get("scope") or ""
+                mk = cd.get("model_key") or ""
+                bits = " ".join(
+                    f"{escape(str(k))}={escape(str(v))}" for k, v in sorted(cd.items())
+                    if v not in (None, ""))
+                lines.append(f"[dim]{'cooldown':>16}[/]  {escape(scope)}"
+                             + (f"/{escape(str(mk))}" if mk else "") + f"  {bits}")
+            for model_name, q in sorted((c.model_quotas or {}).items()):
+                sig = q.get("signals") if isinstance(q, dict) else {}
+                rendered = " ".join(f"{escape(str(k))}={escape(str(v))}"
+                                    for k, v in sorted((sig or {}).items())) or "—"
+                lines.append(f"[dim]{'model quota':>16}[/]  {escape(str(model_name))}: {rendered}")
+            if c.observed_at:
+                lines.append(f"[dim]{'observed':>16}[/]  {escape(c.observed_at)}")
+            yield Vertical(
+                Static(f"[bold cyan]{escape(c.account)}[/] · {escape(c.provider)}"),
+                Static("\n".join(lines)),
                 Static("[dim]esc / enter to close[/]"),
                 id="detail",
             )
@@ -129,7 +148,7 @@ def build_app():
             Binding("right", "tab(+1)", "tab ▶"),
         ]
 
-        TAB_IDS = ["recent", "sessions", "totals"]
+        TAB_IDS = ["recent", "sessions", "quota", "totals"]
 
         def action_tab(self, step: int):
             tc = self.query_one("#right", TabbedContent)
@@ -149,6 +168,7 @@ def build_app():
             self.pricing = pricing
             self.refresh_s = refresh_s
             self.rows = []
+            self.creds = []
             self.conn = None
 
         def compose(self) -> ComposeResult:
@@ -163,6 +183,9 @@ def build_app():
                                         zebra_stripes=True)
                     with TabPane("sessions", id="sessions"):
                         yield DataTable(id="sessions-table", cursor_type="row",
+                                        zebra_stripes=True)
+                    with TabPane("quota", id="quota"):
+                        yield DataTable(id="quota-table", cursor_type="row",
                                         zebra_stripes=True)
                     with TabPane("totals", id="totals"):
                         yield Static(id="totals-pane")
@@ -197,6 +220,7 @@ def build_app():
                 return
             since = time.time() - self._window_s()
             self.rows = load_rows(self.conn, since, self.model_filter or None)
+            self.creds = parse_credentials(load_quota_snapshot(self.conn))
             self._render_all()
 
         # ------------------------------------------------------------ render
@@ -206,11 +230,14 @@ def build_app():
             m.add_columns("model", "req", "fail", "TTFT p50", "TPS p50", "e2e p50",
                           "in", "new", "hit", "out")
             rq = self.query_one("#requests-table", DataTable)
-            rq.add_columns("time", "model", "effort", "in", "hit", "out",
+            rq.add_columns("time", "model", "endpoint", "effort", "in", "hit", "out",
                            "TTFT", "lat", "TPS", "e2e", "session", "")
             s = self.query_one("#sessions-table", DataTable)
             s.add_columns("session", "req", "fail", "in", "new", "out",
                           "lat p50", "last")
+            qt = self.query_one("#quota-table", DataTable)
+            qt.add_columns("account", "status", "ok/fail", "plan",
+                           "daily", "weekly", "resets d/w", "signals")
 
         def _card(self, title, value, sub=""):
             return Static(
@@ -250,6 +277,7 @@ def build_app():
             sb.update(
                 f"{coll}   window [bold]{WINDOWS[self.window_key][0]}[/]"
                 f"   {totals.n} stored"
+                + _quota_chip(self.creds)
                 + (f"   filter [magenta]{self.model_filter}[/]" if self.model_filter else "")
                 + ("   [yellow]PAUSED[/]" if self.paused else ""))
 
@@ -310,7 +338,8 @@ def build_app():
                 ratio = read / total if total else None
                 rt.add_row(
                     datetime.fromtimestamp(r["ts"]).strftime("%H:%M:%S"),
-                    short_model(r), r["effort"] or "",
+                    short_model(r), short_endpoint(field(r, "endpoint")),
+                    r["effort"] or "",
                     fmt_tok(total), fmt_pct(ratio), fmt_tok(r["output_tokens"]),
                     fmt_ms(r["ttft_ms"]), fmt_ms(r["latency_ms"]),
                     "burst" if (not r["failed"] and tps is None
@@ -335,6 +364,22 @@ def build_app():
                            fmt_tok(a.out_tok), fmt_ms(a.lat_p50),
                            datetime.fromtimestamp(max(r["ts"] for r in grp))
                            .strftime("%H:%M:%S"), key=sid)
+
+            # --- quota / credentials
+            qt = self.query_one("#quota-table", DataTable)
+            qt.clear()
+            for c in self.creds:
+                state = c.status + (" · blocked" if c.blocked else "")
+                resets = f"{_fmt_reset(c.daily_reset)}/{_fmt_reset(c.weekly_reset)}"
+                extra = " ".join(f"{k}={v}" for k, v in
+                                 list((c.extra or {}).items())[:8])
+                qt.add_row(
+                    c.account + (f" · {c.provider}" if c.provider else ""), state,
+                    f"{c.ok}/{c.fail}", c.plan or "—",
+                    f"{c.daily_pct}%" if c.daily_pct is not None else "—",
+                    f"{c.weekly_pct}%" if c.weekly_pct is not None else "—",
+                    resets if resets != "—/—" else "—",
+                    extra or "—", key=c.name)
 
             # --- totals pane
             tot = self.query_one("#totals-pane", Static)
@@ -398,7 +443,23 @@ def build_app():
                 return None
             return next((r for r in self.rows if r["id"] == key), None)
 
+        def _selected_cred(self):
+            qt = self.query_one("#quota-table", DataTable)
+            if qt.cursor_row is None or qt.cursor_row >= len(qt.rows):
+                return None
+            try:
+                key = qt.coordinate_to_cell_key(
+                    qt.cursor_coordinate).row_key.value
+            except Exception:
+                return None
+            return next((c for c in self.creds if c.name == key), None)
+
         def action_detail(self):
+            if self.focused is not None and getattr(self.focused, "id", "") == "quota-table":
+                cred = self._selected_cred()
+                if cred:
+                    self.push_screen(CredScreen(cred))
+                return
             row = self._selected_row()
             if row:
                 self.push_screen(DetailScreen(row))
@@ -407,8 +468,41 @@ def build_app():
             # Enter on a highlighted row also opens detail.
             if event.data_table.id == "requests-table":
                 self.action_detail()
+            elif event.data_table.id == "quota-table":
+                cred = self._selected_cred()
+                if cred:
+                    self.push_screen(CredScreen(cred))
 
     return StatsApp
+
+
+def _fmt_reset(ts):
+    if not ts:
+        return "—"
+    delta = ts - time.time()
+    if delta > 0:
+        return fmt_countdown(delta)
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def _quota_chip(creds) -> str:
+    """statusbar snippet: 'quota d100% w81%' from the lowest percentages."""
+    vals = [c for c in creds if c.daily_pct is not None or c.weekly_pct is not None]
+    if not vals:
+        return ""
+    daily = min((c.daily_pct for c in vals if c.daily_pct is not None), default=None)
+    weekly = min((c.weekly_pct for c in vals if c.weekly_pct is not None), default=None)
+    txt = "   quota"
+    if daily is not None:
+        txt += f" d{daily}%"
+    if weekly is not None:
+        txt += f" w{weekly}%"
+    low = min(p for p in (daily, weekly) if p is not None)
+    style = "green" if low >= 50 else ("yellow" if low >= 20 else "red")
+    chip = f"[{style}]{txt}[/]"
+    if any(c.blocked for c in creds):
+        chip += " [red]blocked[/]"
+    return chip
 
 
 def cmd_tui(args) -> None:

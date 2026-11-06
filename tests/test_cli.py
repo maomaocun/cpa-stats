@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -31,13 +32,24 @@ class TestParseDuration:
 class FakeQueue:
     """Tiny HTTP server that behaves like CPA's /v0/management/usage-queue."""
 
-    def __init__(self, records):
+    def __init__(self, records, credentials=None):
         self.records = list(records)
+        self.credentials = credentials
         self.requests = 0
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self_inner):  # noqa: N805
                 self.requests += 1
+                if "credentials" in self_inner.path or "auth-files" in self_inner.path:
+                    if self.credentials is None:
+                        self_inner.send_error(404)
+                        return
+                    body = json.dumps(self.credentials).encode()
+                    self_inner.send_response(200)
+                    self_inner.send_header("Content-Type", "application/json")
+                    self_inner.end_headers()
+                    self_inner.wfile.write(body)
+                    return
                 if "usage-queue" not in self_inner.path:
                     self_inner.send_error(404)
                     return
@@ -66,7 +78,7 @@ class FakeQueue:
 
 def make_rec(i):
     return {
-        "timestamp": "2026-11-02T19:55:38.436314676+08:00",
+        "timestamp": datetime.now().astimezone().isoformat(),
         "execution_id": f"e{i}",
         "model": "devin/swe-2",
         "latency_ms": 1000,
@@ -88,6 +100,38 @@ class TestCollect:
             rows = load_rows(conn, 0)
             assert len(rows) == 7
             assert rows[0]["token_quality"] == "complete"
+
+    def test_credentials_snapshot(self, tmp_path):
+        creds = {"observed_at": "2026-11-06T14:23:38+08:00", "files": [{
+            "id": "devin-a.json", "name": "devin-a.json", "provider": "devin",
+            "status": "active", "success": 10, "failed": 1,
+            "email": "a@example.com",
+            "quota": {"observed_at": "2026-11-06T14:23:38+08:00",
+                      "signals": {"plan": "Max",
+                                  "daily_quota_remaining_percent": "100%",
+                                  "weekly_quota_remaining_percent": "81%",
+                                  "weekly_quota_reset_at": "2026-11-08T08:00:00Z"}}}]}
+        with FakeQueue([], credentials=creds) as q:
+            db = tmp_path / "r.db"
+            main(["collect", "--db", str(db), "--url", f"http://127.0.0.1:{q.port}",
+                  "--mgmt-key-file", str(self._key(tmp_path)), "--once"])
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            from cpa_stats.storage import load_quota_snapshot
+            snap = load_quota_snapshot(conn)
+            assert snap["files"][0]["name"] == "devin-a.json"
+            assert snap["fetched_at"] > 0
+
+    def test_credentials_off_when_interval_zero(self, tmp_path):
+        with FakeQueue([], credentials={"files": [{"name": "x"}]}) as q:
+            db = tmp_path / "r.db"
+            main(["collect", "--db", str(db), "--url", f"http://127.0.0.1:{q.port}",
+                  "--mgmt-key-file", str(self._key(tmp_path)),
+                  "--quota-interval", "0", "--once"])
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            from cpa_stats.storage import load_quota_snapshot
+            assert load_quota_snapshot(conn) is None
 
     def test_v8_path_preferred(self, tmp_path):
         """v8 endpoint should be tried first and cached."""
@@ -177,3 +221,59 @@ class TestPriceFlag:
         main(["summary", "--db", str(db), "--since", "1d", "--price", "2,0.2,8"])
         out = capsys.readouterr().out
         assert "$" in out or "cost" in out
+
+
+class TestQuotaCmd:
+    def _db_with_snapshot(self, tmp_path):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import save_quota_snapshot
+        save_quota_snapshot(conn, {
+            "fetched_at": time.time(),
+            "files": [{"name": "devin-a.json", "provider": "devin",
+                       "status": "active", "success": 10, "failed": 1,
+                       "email": "a@example.com",
+                       "quota": {"signals": {
+                           "plan": "Max",
+                           "daily_quota_remaining_percent": "100%",
+                           "weekly_quota_remaining_percent": "81%"}}}]})
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_quota(self, tmp_path, capsys):
+        db = self._db_with_snapshot(tmp_path)
+        main(["quota", "--db", str(db)])
+        out = capsys.readouterr().out
+        assert "a@example.com" in out
+        assert "81%" in out and "100%" in out
+        assert "Max" in out
+
+    def test_quota_empty(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        conn.close()
+        main(["quota", "--db", str(db)])
+        out = capsys.readouterr().out
+        assert "no credential snapshot" in out
+
+
+class TestShowCmd:
+    def test_show_by_id_prefix(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1)])
+        conn.close()
+        main(["show", "--db", str(db), "e1"])
+        out = capsys.readouterr().out
+        assert "request detail" in out
+        assert "swe-2" in out
+        assert "input tokens" in out
+
+    def test_show_missing(self, tmp_path):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        conn.close()
+        with pytest.raises(SystemExit):
+            main(["show", "--db", str(db), "nope"])

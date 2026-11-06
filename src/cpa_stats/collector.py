@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .storage import insert_records, meta_set, open_db, prune
+from .storage import (insert_records, meta_set, open_db, prune,
+                      save_quota_snapshot)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -82,20 +83,32 @@ USAGE_QUEUE_PATHS = (
     "/v0/management/usage-queue",
 )
 
+# Credentials endpoints carry per-account quota signals / cooldown state.
+CREDENTIALS_PATHS = (
+    "/v8/management/credentials",
+    "/v0/management/auth-files",
+)
+
 _usage_queue_path: str | None = None
+_credentials_path: str | None = None
 
 
-def _fetch_queue_path(cfg: CPAConfig, path: str, batch: int, timeout: float):
+def _mgmt_get(cfg: CPAConfig, path: str, timeout: float):
+    """GET a management endpoint; returns (parsed_json, error)."""
     req = urllib.request.Request(
-        f"{cfg.url}{path}?count={batch}",
+        f"{cfg.url}{path}",
         headers={"Authorization": f"Bearer {cfg.mgmt_key}"},
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read() or b"[]"), None
+            return json.loads(resp.read() or b"{}"), None
     except urllib.error.HTTPError as exc:
         return None, exc
+
+
+def _fetch_queue_path(cfg: CPAConfig, path: str, batch: int, timeout: float):
+    return _mgmt_get(cfg, f"{path}?count={batch}", timeout)
 
 
 def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]:
@@ -117,6 +130,27 @@ def fetch_queue(cfg: CPAConfig, batch: int, timeout: float = 10.0) -> list[dict]
     if last_err:
         raise last_err
     return []
+
+
+def fetch_credentials(cfg: CPAConfig, timeout: float = 10.0) -> dict:
+    """Snapshot of managed credentials: quota signals, status, cooldowns."""
+    global _credentials_path
+    candidates = [_credentials_path] if _credentials_path else list(CREDENTIALS_PATHS)
+    last_err = None
+    for path in candidates:
+        data, err = _mgmt_get(cfg, path, timeout)
+        if err is None:
+            _credentials_path = path
+            if isinstance(data, list):  # tolerate a bare [...] body
+                data = {"files": data}
+            return data if isinstance(data, dict) else {"files": []}
+        last_err = err
+        if err.code == 404:
+            continue
+        raise
+    if last_err:
+        raise last_err
+    return {"files": []}
 
 
 def cmd_collect(args) -> None:
@@ -155,6 +189,9 @@ def cmd_collect(args) -> None:
     last_error = None
     total = 0
     last_prune = 0.0
+    quota_every = max(float(args.quota_interval), 0.0)
+    last_quota = 0.0
+    quota_err = None
     while not stop["flag"]:
         try:
             got = 0
@@ -200,6 +237,25 @@ def cmd_collect(args) -> None:
             except sqlite3.Error:
                 pass
             backoff = min(max(backoff * 2, args.interval), 30)
+        if quota_every and time.time() - last_quota >= quota_every:
+            try:
+                snap = fetch_credentials(cfg)
+                payload = {"fetched_at": time.time(),
+                           "observed_at": snap.get("observed_at"),
+                           "files": snap.get("files") or []}
+                with conn:
+                    save_quota_snapshot(conn, payload)
+                if quota_err:
+                    log("quota snapshot recovered")
+                    quota_err = None
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                msg = str(getattr(exc, "reason", exc))
+                if isinstance(exc, urllib.error.HTTPError):
+                    msg = f"HTTP {exc.code} from credentials endpoint"
+                if msg != quota_err:
+                    log(f"quota snapshot error: {msg}")
+                quota_err = msg
+            last_quota = time.time()
         if args.retention_days and args.retention_days > 0 and time.time() - last_prune > 3600:
             try:
                 n = prune(conn, args.retention_days * 86400)
