@@ -9,11 +9,13 @@ Layout
 Keys
     1-7     window 15m / 1h / 6h / 24h / 7d / 30d / all
     up/down   select a row (mouse wheel scrolls; click selects)
-    left/right switch right-hand tabs (recent / sessions / heatmap / quota / totals)
+    left/right switch right-hand tabs (recent / sessions / trend / heatmap / quota / totals)
     tab       cycle focus between panels
     enter     detail modal (request or credential)
     enter on models row    filter everything to that model (again to clear)
     f         filter (model substring)
+    s         cycle model-table sort (req → in → out → tps → lat)
+    e         export the current window rows to a CSV file in cwd
     enter on sessions row  filter everything to that session (again to clear)
     p         pause / resume refresh
     r         force refresh
@@ -28,13 +30,15 @@ from pathlib import Path
 
 from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
-from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
-                    cred_sort_key, decode_tps, e2e_tps, field, group_by,
-                    parse_credentials, parse_iso_ts, quota_forecast,
-                    quota_pace, quota_pct_series, request_detail_pairs,
-                    short_endpoint, short_model, token_parts)
+from .model import (COLUMNS, MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate,
+                    bucket_aggs, bucket_counts, cred_sort_key, decode_tps,
+                    e2e_tps, export_dict, field, group_by, parse_credentials,
+                    parse_iso_ts, pick_bucket, quota_forecast, quota_pace,
+                    quota_pct_series, request_detail_pairs, short_endpoint,
+                    short_model, token_parts)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
+from .views import trend_lines
 
 WINDOWS = {  # key -> seconds
     "1": ("15m", 15 * 60),
@@ -206,6 +210,8 @@ def build_app():
             Binding("6", "win('6')", "30d"),
             Binding("7", "win('7')", "all"),
             Binding("f", "toggle_filter", "filter"),
+            Binding("s", "cycle_sort", "sort"),
+            Binding("e", "export_rows", "export"),
             Binding("p", "toggle_pause", "pause"),
             Binding("r", "refresh_data", "refresh"),
             Binding("enter", "detail", "detail"),
@@ -213,7 +219,9 @@ def build_app():
             Binding("right", "tab(+1)", "tab ▶"),
         ]
 
-        TAB_IDS = ["recent", "sessions", "heatmap", "quota", "totals"]
+        TAB_IDS = ["recent", "sessions", "trend", "heatmap", "quota", "totals"]
+
+        MODEL_SORTS = ["req", "in", "out", "tps", "lat"]
 
         def action_tab(self, step: int):
             tc = self.query_one("#right", TabbedContent)
@@ -227,6 +235,7 @@ def build_app():
         paused = reactive(False)
         model_filter = reactive("")
         session_filter = reactive("")
+        model_sort_key = "req"
 
         def __init__(self, db_path, pricing=None, refresh_s=2.0):
             super().__init__()
@@ -253,6 +262,8 @@ def build_app():
                     with TabPane("sessions", id="sessions"):
                         yield DataTable(id="sessions-table", cursor_type="row",
                                         zebra_stripes=True)
+                    with TabPane("trend", id="trend"):
+                        yield Static(id="trend-pane")
                     with TabPane("heatmap", id="heatmap"):
                         yield Static(id="heatmap-pane")
                     with TabPane("quota", id="quota"):
@@ -359,6 +370,8 @@ def build_app():
                 f"{coll}   window [bold]{WINDOWS[self.window_key][0]}[/]"
                 f"   {totals.n} stored"
                 + _quota_chip(self.creds)
+                + (f"   sort [bold]{self.model_sort_key}[/]"
+                   if self.model_sort_key != "req" else "")
                 + (f"   [magenta]sess {self.session_filter[-8:]}[/]"
                    if self.session_filter else "")
                 + (f"   filter [magenta]{self.model_filter}[/]" if self.model_filter else "")
@@ -403,9 +416,16 @@ def build_app():
             # --- per model
             mt = self.query_one("#models", DataTable)
             mt.clear()
-            for name, grp in sorted(group_by(rows, short_model).items(),
-                                    key=lambda kv: -len(kv[1])):
-                a = aggregate(grp, win)
+            keyfns = {"req": lambda a: a.n, "in": lambda a: a.in_tok,
+                      "out": lambda a: a.out_tok,
+                      "tps": lambda a: a.tps_p50 or -1,
+                      "lat": lambda a: a.lat_p50 or -1}
+            keyfn = keyfns.get(self.model_sort_key, keyfns["req"])
+            ranked = sorted(
+                ((aggregate(grp, win), name) for name, grp
+                 in group_by(rows, short_model).items()),
+                key=lambda t: -keyfn(t[0]))
+            for a, name in ranked:
                 mt.add_row(name, str(a.n), str(a.failed),
                            fmt_ms(a.ttft_p50), fmt_tps(a.tps_p50),
                            fmt_tps(a.e2e_p50), fmt_tok(a.in_tok),
@@ -463,6 +483,14 @@ def build_app():
             self.query_one("#heatmap-pane", Static).update(
                 _heatmap_text(hm_rows))
 
+            # --- trend tab: per-metric sparklines over the window
+            b_s, nb = pick_bucket(span, target=48)
+            aggs = bucket_aggs(rows, time.time() - span, b_s, nb, self.pricing)
+            self.query_one("#trend-pane", Static).update(
+                f"[dim]{window_label(b_s)} buckets · "
+                f"{sum(1 for a in aggs if a)} active[/]\n"
+                + "\n".join(trend_lines(aggs)))
+
             # --- quota / credentials
             qt = self.query_one("#quota-table", DataTable)
             qt.clear()
@@ -518,6 +546,37 @@ def build_app():
         def action_toggle_pause(self):
             self.paused = not self.paused
             self._render_all()
+
+        def action_cycle_sort(self):
+            i = (self.MODEL_SORTS.index(self.model_sort_key) + 1) \
+                % len(self.MODEL_SORTS)
+            self.model_sort_key = self.MODEL_SORTS[i]
+            self._render_all()
+
+        def action_export_rows(self):
+            """Write the current window rows to a CSV file in cwd."""
+            import csv
+
+            if not self.rows:
+                self.notify("no rows in the current window")
+                return
+            path = Path.cwd() / (
+                f"cpa-stats-{WINDOWS[self.window_key][0]}-"
+                f"{int(time.time())}.csv")
+            fields = [c for c in COLUMNS if c != "raw"] + [
+                "prompt_tokens_total", "uncached_tokens", "cache_hit_ratio",
+                "decode_tps", "e2e_tps", "iso_time",
+            ]
+            try:
+                with path.open("w", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=fields)
+                    w.writeheader()
+                    for r in reversed(self.rows):
+                        w.writerow(export_dict(r))
+            except OSError as exc:
+                self.notify(f"export failed: {exc}", severity="error")
+                return
+            self.notify(f"exported {len(self.rows)} rows → {path.name}")
 
         def action_toggle_filter(self):
             w = self.query_one("#filter", Input)

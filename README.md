@@ -37,6 +37,9 @@ cpa-stats show <id>                       # every captured field of one request 
 cpa-stats quota                           # credential quota / cooldowns + burn forecast
 cpa-stats errors                          # failure breakdown by model / status / code / endpoint
 cpa-stats top --since 7d                  # heaviest requests (by tokens / output / cost / latency)
+cpa-stats trend --since 7d --bucket 6h    # metric sparklines per bucket (req/fail/TTFT/TPS/tokens)
+cpa-stats report --since 24h              # compact digest (--webhook posts it to Lark/generic)
+cpa-stats sql 'SELECT model, COUNT(*) FROM requests GROUP BY 1'   # ad-hoc read-only SQL
 cpa-stats serve --port 8399               # read-only web dashboard (auto-refresh) + /api/rows
 cpa-stats summary --since 7d --by model   # aggregate report
 cpa-stats export --since 7d -o out.csv    # CSV / JSONL export
@@ -44,6 +47,8 @@ cpa-stats prune --older-than 30d          # drop old records
 ```
 
 View commands accept `-m` (model), `-s` (session) and `-a` (account) filters.
+`summary`, `errors`, `top`, `quota`, `show`, `trend`, `report` also take
+`--json` for scripting.
 
 ### `cpa-stats tui`
 
@@ -53,17 +58,20 @@ Interactive dashboard (textual). Same data as `watch`, but navigable:
 |-|-|
 | `1`–`7` | switch window: 15 m / 1 h / 6 h / 24 h / 7 d / 30 d / all |
 | `↑` `↓` / wheel / click | select a row in the focused table |
-| `←` `→` | cycle right-hand tabs (recent · sessions · quota · totals) |
+| `←` `→` | cycle right-hand tabs (recent · sessions · trend · heatmap · quota · totals) |
 | `tab` | cycle focus between panels |
 | `enter` | request/credential detail modal; on a session or model row: filter to it (again to clear) |
 | `f` | toggle the model filter input |
+| `s` | cycle the models-table sort key (req → in → out → tps → lat) |
+| `e` | export the current window's rows to a CSV file in cwd |
 | `p` | pause / resume auto-refresh |
 | `r` | force refresh |
 | `q` / `esc` | quit / close modal |
 
-Five tabs on the right: **recent** (every request, selectable → detail),
-**sessions** (top sessions by tokens), **heatmap** (7-day × 24-hour request
-volume grid), **quota** (per-credential quota signals, selectable → full
+Six tabs on the right: **recent** (every request, selectable → detail),
+**sessions** (top sessions by tokens), **trend** (per-bucket metric
+sparklines over the window), **heatmap** (7-day × 24-hour request volume
+grid), **quota** (per-credential quota signals, selectable → full
 cooldown/signal detail), **totals** (all-time rollup + data quality). The
 statusbar shows the lowest remaining quota across credentials.
 
@@ -131,6 +139,10 @@ the window failure rate exceeds 5%. With `--alert-webhook`, the collector
 POSTs text alerts on quota transitions (window below `--alert-below`,
 blocked/limited flips, recovery, forecast exhaustion within
 `--alert-eta-hours`) — Lark bot webhooks work.
+Request-level failure spikes alert too: a rolling `--alert-fail-window`
+(default 10m) fires once the failure share reaches `--alert-fail-pct`
+(25%) given at least `--alert-fail-min` requests (10), and again on
+recovery. `cpa-stats report --webhook` posts a digest on demand (cron).
 
 ## Collector
 
@@ -143,7 +155,8 @@ cpa-stats collect --retention-days 30   # auto-prune, checked hourly
 cpa-stats collect --quota-interval 30   # credentials/quota snapshot every 30 s
 cpa-stats collect --alert-webhook https://open.feishu.cn/...   # Lark/generic webhook alerts
 #   fires on: quota < --alert-below (20%), blocked/limited flips, recovery,
-#   forecast exhaustion within --alert-eta-hours
+#   forecast exhaustion within --alert-eta-hours, failure spikes
+#   (--alert-fail-pct / --alert-fail-window / --alert-fail-min)
 cpa-stats install-service               # write + enable a systemd --user unit
 ```
 
@@ -153,7 +166,14 @@ never lost.
 
 Configuration is auto-discovered from `~/.config/cliproxy/config.yaml` (port)
 and `management.key` next to it. Override with `CPA_URL`, `CPA_MGMT_KEY`,
-`CPA_DIR`, `CPA_STATS_DB`, or the matching flags.
+`CPA_DIR`, `CPA_STATS_DB`, `CPA_STATS_PRICE` (default `--price`),
+`CPA_STATS_ALERT_WEBHOOK` (default `--alert-webhook` / `report --webhook`),
+or the matching flags.
+
+`cpa-stats serve` exposes: `/` (HTML dashboard, auto-refresh), `/api/rows`,
+`/api/summary`, `/api/quota`, `/api/errors` (JSON), `/metrics` (Prometheus
+exposition — stored totals, per-window p50/p95 TTFT/latency/TPS,
+per-credential quota %, collector heartbeat) and `/healthz`.
 
 ## Database
 

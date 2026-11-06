@@ -19,8 +19,8 @@ from pathlib import Path
 
 from . import __version__, __doc__ as DOC
 from .collector import cmd_collect, die, load_cpa_config
-from .format import fmt_age, fmt_tok, window_label
-from .model import COLUMNS, decode_tps, e2e_tps, parse_pricing, token_parts
+from .format import fmt_age, window_label
+from .model import COLUMNS, export_dict, parse_pricing
 from .storage import load_rows, meta_get, open_db, open_db_ro, prune
 
 
@@ -54,13 +54,7 @@ def cmd_export(args) -> None:
             w = csv.DictWriter(out, fieldnames=fields)
             w.writeheader()
         for r in rows:
-            d = {c: r[c] for c in COLUMNS if c != "raw" and c in r.keys()}
-            total, uncached, read, _ = token_parts(r)
-            d["prompt_tokens_total"], d["uncached_tokens"] = total, uncached
-            d["cache_hit_ratio"] = round(read / total, 4) if total else None
-            d["decode_tps"] = decode_tps(r["output_tokens"], r["latency_ms"], r["ttft_ms"])
-            d["e2e_tps"] = e2e_tps(r["output_tokens"], r["latency_ms"])
-            d["iso_time"] = datetime.fromtimestamp(r["ts"]).astimezone().isoformat()
+            d = export_dict(r)
             if args.format == "csv":
                 w.writerow(d)
             else:
@@ -217,8 +211,10 @@ WantedBy=default.target
 
 def add_price_arg(p):
     p.add_argument("--price", metavar="IN,CACHED,OUT",
+                   default=os.environ.get("CPA_STATS_PRICE"),
                    help="USD per 1M tokens for input / cache-read / output; "
-                        "enables the est. cost card (e.g. '2,0.2,8')")
+                        "enables the est. cost card (e.g. '2,0.2,8'; "
+                        "env CPA_STATS_PRICE)")
 
 
 def main(argv=None) -> None:
@@ -257,7 +253,8 @@ def main(argv=None) -> None:
     w.set_defaults(func=cmd_watch)
 
     tu = sub.add_parser("tui", parents=[common],
-                        help="interactive TUI (textual): keys 1-4 window, f filter, enter detail")
+                        help="interactive TUI (textual): keys 1-7 window, f filter, "
+                             "s sort, e export, enter detail")
     tu.add_argument("-r", "--refresh", type=float, default=2.0)
     add_price_arg(tu)
     from .tui import cmd_tui
@@ -279,6 +276,7 @@ def main(argv=None) -> None:
                                     "endpoint", "provider", "upstream",
                                     "node_kind", "hour", "day"],
                    default="model")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
     add_price_arg(s)
     s.set_defaults(func=cmd_summary)
 
@@ -287,12 +285,14 @@ def main(argv=None) -> None:
     q.add_argument("-r", "--refresh", action="store_true",
                    help="force CPA to re-observe credentials upstream first "
                         "(POST /credentials/refresh), then store + show")
+    q.add_argument("--json", action="store_true", help="machine-readable output")
     q.set_defaults(func=cmd_quota)
 
     er = sub.add_parser("errors", parents=[common, filters],
                         help="failure breakdown by model / status / code / endpoint")
     er.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
                     help="window (default 24h)")
+    er.add_argument("--json", action="store_true", help="machine-readable output")
     er.set_defaults(func=cmd_errors)
 
     tp = sub.add_parser("top", parents=[common, filters],
@@ -302,6 +302,7 @@ def main(argv=None) -> None:
     tp.add_argument("--by", choices=["tokens", "output", "cost", "latency"],
                     default="tokens")
     tp.add_argument("-n", "--limit", type=int, default=15)
+    tp.add_argument("--json", action="store_true", help="machine-readable output")
     add_price_arg(tp)
     tp.set_defaults(func=cmd_top)
 
@@ -310,7 +311,46 @@ def main(argv=None) -> None:
     sh.add_argument("request_id")
     sh.add_argument("--raw", action="store_true",
                     help="also dump the raw upstream record JSON")
+    sh.add_argument("--json", action="store_true",
+                    help="print the stored row as JSON (raw parsed)")
     sh.set_defaults(func=cmd_show)
+
+    tr = sub.add_parser("trend", parents=[common, filters],
+                        help="metric trends over time buckets (sparklines)")
+    tr.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
+                    help="window (default 24h)")
+    tr.add_argument("--bucket", type=parse_duration,
+                    help="bucket size, e.g. 15m/1h (default: auto, ~40 buckets)")
+    tr.add_argument("--metric",
+                    help="comma list of metrics: req,fail,ttft,lat,tps,e2e,"
+                         "in,out,hit,cost (default all)")
+    tr.add_argument("--json", action="store_true", help="machine-readable output")
+    add_price_arg(tr)
+    from .views import cmd_trend
+    tr.set_defaults(func=cmd_trend)
+
+    sq = sub.add_parser("sql", parents=[common],
+                        help="run a read-only SQL query on the requests db")
+    sq.add_argument("query",
+                    help="SELECT/WITH/EXPLAIN/PRAGMA statement")
+    sq.add_argument("--format", choices=["table", "csv", "json"],
+                    default="table")
+    sq.add_argument("--limit", type=int, default=500,
+                    help="max rows displayed (default 500)")
+    from .views import cmd_sql
+    sq.set_defaults(func=cmd_sql)
+
+    rp = sub.add_parser("report", parents=[common, filters],
+                        help="compact digest; --webhook posts it (Lark/generic)")
+    rp.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
+                    help="window (default 24h)")
+    rp.add_argument("--webhook",
+                    default=os.environ.get("CPA_STATS_ALERT_WEBHOOK"),
+                    help="POST the digest to this URL (env CPA_STATS_ALERT_WEBHOOK)")
+    rp.add_argument("--json", action="store_true")
+    add_price_arg(rp)
+    from .views import cmd_report
+    rp.set_defaults(func=cmd_report)
 
     e = sub.add_parser("export", parents=[common, filters], help="export rows as csv / jsonl")
     e.add_argument("--since", type=parse_duration, default=parse_duration("24h"))
@@ -332,13 +372,24 @@ def main(argv=None) -> None:
     c.add_argument("--retention-days", type=float, default=90,
                    help="delete records older than this, checked hourly (0 = keep forever)")
     c.add_argument("--alert-webhook",
+                   default=os.environ.get("CPA_STATS_ALERT_WEBHOOK"),
                    help="POST text alerts to this URL on quota transitions "
-                        "(low %, blocked/limited, recovery; Lark bot webhooks work)")
+                        "(low %, blocked/limited, recovery, failure spikes; "
+                        "env CPA_STATS_ALERT_WEBHOOK; Lark bot webhooks work)")
     c.add_argument("--alert-below", type=float, default=20.0,
                    help="alert when a quota window drops below this %% (default 20)")
     c.add_argument("--alert-eta-hours", type=float, default=0.0,
                    help="also alert when the burn forecast reaches 0%% within "
                         "N hours (0 = off)")
+    c.add_argument("--alert-fail-pct", type=float, default=25.0,
+                   help="alert when the rolling failure share reaches this %% "
+                        "(default 25)")
+    c.add_argument("--alert-fail-window", type=float, default=600.0,
+                   help="rolling window seconds for failure-share alerts "
+                        "(default 600)")
+    c.add_argument("--alert-fail-min", type=int, default=10,
+                   help="minimum requests in the rolling window before "
+                        "failure-share alerts can fire (default 10)")
     c.add_argument("--once", action="store_true", help="drain once and exit")
     c.add_argument("-v", "--verbose", action="store_true")
     c.set_defaults(func=cmd_collect)

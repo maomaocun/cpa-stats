@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -325,6 +326,45 @@ def bucket_counts(rows, since_ts: float, bucket_s: float, buckets: int) -> list[
         if 0 <= idx < buckets:
             counts[idx] += 1
     return counts
+
+
+# Friendly bucket sizes for `trend` (seconds).
+BUCKET_LADDER = (60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600,
+                 43200, 86400)
+
+
+def pick_bucket(window_s: float, target: int = 40) -> tuple[float, int]:
+    """(bucket_s, n_buckets) covering window_s, snapped to a friendly size."""
+    if window_s <= 0:
+        window_s = 3600
+    for b in BUCKET_LADDER:
+        if window_s / b <= target:
+            return float(b), max(1, math.ceil(window_s / b))
+    b = float(math.ceil(window_s / target / 86400) * 86400)
+    return b, max(1, math.ceil(window_s / b))
+
+
+def bucket_aggs(rows, since_ts: float, bucket_s: float, nbuckets: int,
+                pricing=None) -> list:
+    """One Agg per time bucket (oldest -> newest); None for empty buckets."""
+    buckets: list[list] = [[] for _ in range(nbuckets)]
+    for r in rows:
+        idx = int((r["ts"] - since_ts) / bucket_s)
+        if 0 <= idx < nbuckets:
+            buckets[idx].append(r)
+    return [aggregate(b, bucket_s, pricing) if b else None for b in buckets]
+
+
+def export_dict(r) -> dict:
+    """Flat dict for one request row — the export/tui-`e`/`show --json` shape."""
+    d = {c: r[c] for c in COLUMNS if c != "raw" and c in r.keys()}
+    total, uncached, read, _ = token_parts(r)
+    d["prompt_tokens_total"], d["uncached_tokens"] = total, uncached
+    d["cache_hit_ratio"] = round(read / total, 4) if total else None
+    d["decode_tps"] = decode_tps(r["output_tokens"], r["latency_ms"], r["ttft_ms"])
+    d["e2e_tps"] = e2e_tps(r["output_tokens"], r["latency_ms"])
+    d["iso_time"] = datetime.fromtimestamp(r["ts"]).astimezone().isoformat()
+    return d
 
 
 # --------------------------------------------------------------------------- quota

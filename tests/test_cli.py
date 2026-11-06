@@ -564,3 +564,265 @@ class TestServe:
             assert b"e1" in rows
         finally:
             srv.shutdown()
+
+    def _server(self, db_path):
+        from cpa_stats.views import make_serve_server
+        import argparse
+        args = argparse.Namespace(
+            db=str(db_path), window=3600, model=None, session=None,
+            account=None, bind="127.0.0.1", port=0, refresh=5, limit=30,
+            width=120, pricing=None)
+        srv = make_serve_server(args)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_metrics_endpoint(self, tmp_path):
+        import urllib.request
+
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1), make_rec(2)])
+        conn.close()
+        srv = self._server(db)
+        try:
+            port = srv.server_address[1]
+            body = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/metrics", timeout=3).read().decode()
+            assert "cpa_stats_requests_total 2" in body
+            assert 'cpa_stats_window_requests{window="1h"} 2' in body
+            assert 'kind="output"' in body
+        finally:
+            srv.shutdown()
+
+    def test_api_endpoints(self, tmp_path):
+        import urllib.request
+
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records, save_quota_snapshot
+        insert_records(conn, [make_rec(1),
+                              dict(make_rec(2), failed=True,
+                                   fail={"status_code": 429,
+                                         "body": "x", "code": "rate_limit"})])
+        save_quota_snapshot(conn, {
+            "fetched_at": time.time(),
+            "files": [{"name": "devin-a.json", "provider": "devin",
+                       "status": "active", "email": "a@example.com",
+                       "quota": {"signals": {
+                           "weekly_quota_remaining_percent": "81%"}}}]})
+        conn.commit()
+        conn.close()
+        srv = self._server(db)
+        try:
+            port = srv.server_address[1]
+            summary = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/summary", timeout=3).read())
+            assert summary["n"] == 2 and summary["failed"] == 1
+            quota = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/quota", timeout=3).read())
+            assert quota["credentials"][0]["account"] == "a@example.com"
+            assert quota["credentials"][0]["weekly_pct"] == 81
+            errors = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/errors", timeout=3).read())
+            assert errors[0]["status"] == 429 and errors[0]["count"] == 1
+        finally:
+            srv.shutdown()
+
+
+class TestTrend:
+    def _db(self, tmp_path, recs):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, recs)
+        conn.close()
+        return db
+
+    def test_trend_table(self, tmp_path, capsys):
+        db = self._db(tmp_path, [make_rec(i) for i in range(9)])
+        main(["trend", "--db", str(db), "--since", "1h", "--bucket", "15m"])
+        out = capsys.readouterr().out
+        assert "trend" in out and "req" in out and "TTFT p50" in out
+
+    def test_trend_json(self, tmp_path, capsys):
+        db = self._db(tmp_path, [make_rec(1)])
+        main(["trend", "--db", str(db), "--since", "1h", "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["bucket_s"] > 0 and len(out["buckets"]) >= 1
+        assert any(b["req"] for b in out["buckets"])
+
+    def test_trend_bad_metric(self, tmp_path):
+        db = self._db(tmp_path, [make_rec(1)])
+        with pytest.raises(SystemExit):
+            main(["trend", "--db", str(db), "--metric", "nope"])
+
+
+class TestSql:
+    def _db(self, tmp_path):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1), make_rec(2)])
+        conn.close()
+        return db
+
+    def test_select(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["sql", "--db", str(db),
+              "SELECT model, COUNT(*) n FROM requests GROUP BY model"])
+        out = capsys.readouterr().out
+        assert "swe-2" in out
+
+    def test_json_format(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["sql", "--db", str(db), "--format", "json",
+              "SELECT COUNT(*) n FROM requests"])
+        assert json.loads(capsys.readouterr().out)[0]["n"] == 2
+
+    def test_rejects_writes(self, tmp_path):
+        db = self._db(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["sql", "--db", str(db), "DELETE FROM requests"])
+
+
+class TestReport:
+    def test_prints(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1)])
+        conn.close()
+        main(["report", "--db", str(db), "--since", "1h"])
+        out = capsys.readouterr().out
+        assert "requests" in out and "swe-2" in out
+
+    def test_webhook(self, tmp_path, capsys):
+        sent = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self_inner):
+                n = int(self_inner.headers.get("Content-Length") or 0)
+                sent.append(json.loads(self_inner.rfile.read(n)))
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            db = tmp_path / "r.db"
+            conn = open_db(db)
+            from cpa_stats.storage import insert_records
+            insert_records(conn, [make_rec(1)])
+            conn.close()
+            main(["report", "--db", str(db), "--since", "1h",
+                  "--webhook", f"http://127.0.0.1:{server.server_address[1]}"])
+            assert "requests" in sent[0]["text"]
+        finally:
+            server.shutdown()
+
+
+class TestJsonOutputs:
+    def _db(self, tmp_path):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1), dict(make_rec(2), failed=True,
+                                                fail={"status_code": 500,
+                                                      "body": "boom"})])
+        conn.close()
+        return db
+
+    def test_summary_json(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["summary", "--db", str(db), "--since", "1h", "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["aggregate"]["n"] == 2 and out["aggregate"]["failed"] == 1
+        assert "swe-2" in out["groups"]
+
+    def test_errors_json(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["errors", "--db", str(db), "--since", "1h", "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["failed"] == 1 and out["groups"][0]["status"] == 500
+
+    def test_top_json(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["top", "--db", str(db), "--since", "1h", "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert len(out["rows"]) == 2 and "raw" not in out["rows"][0]
+
+    def test_show_json(self, tmp_path, capsys):
+        db = self._db(tmp_path)
+        main(["show", "--db", str(db), "e1", "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["id"] == "e1" and isinstance(out["raw"], dict)
+
+    def test_quota_json_empty(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        conn.close()
+        main(["quota", "--db", str(db), "--json"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["credentials"] == []
+
+
+class TestRequestAlerts:
+    def test_fail_spike_fires_and_recovers(self, tmp_path):
+        sent = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self_inner):
+                n = int(self_inner.headers.get("Content-Length") or 0)
+                sent.append(json.loads(self_inner.rfile.read(n)))
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import argparse
+            from collections import deque
+
+            from cpa_stats.collector import check_request_alerts
+            conn = open_db(tmp_path / "r.db")
+            args = argparse.Namespace(
+                alert_webhook=f"http://127.0.0.1:{server.server_address[1]}",
+                alert_fail_window=600.0, alert_fail_min=3,
+                alert_fail_pct=50.0)
+            log = lambda m: None
+            now = time.time()
+            bad = deque([(now, True, "m1"), (now, True, "m1"),
+                         (now, True, "m2"), (now, False, "m1")])
+            check_request_alerts(conn, bad, args, log)
+            check_request_alerts(conn, bad, args, log)  # no duplicate
+            assert len(sent) == 1 and "75%" in sent[0]["text"]
+            good = deque([(now, False, "m1")] * 10)
+            check_request_alerts(conn, good, args, log)
+            assert len(sent) == 2 and "back to" in sent[1]["text"]
+            conn.close()
+        finally:
+            server.shutdown()
+
+    def test_below_min_requests_silent(self, tmp_path):
+        import argparse
+        from collections import deque
+
+        from cpa_stats.collector import check_request_alerts
+        from cpa_stats.storage import meta_get
+        conn = open_db(tmp_path / "r.db")
+        args = argparse.Namespace(alert_webhook="http://127.0.0.1:1",
+                                  alert_fail_window=600.0, alert_fail_min=10,
+                                  alert_fail_pct=50.0)
+        bad = deque([(time.time(), True, "m")] * 3)  # only 3 < min 10
+        check_request_alerts(conn, bad, args, lambda m: None)  # no webhook call
+        assert meta_get(conn, "alert_state") in (None, "{}")
+        conn.close()

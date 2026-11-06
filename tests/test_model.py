@@ -5,6 +5,7 @@ from cpa_stats.model import (COLUMNS, MIN_DECODE_MS, Pricing, decode_tps,
                              parse_pricing, parse_pct, parse_ts, pct,
                              quota_forecast, quota_pct_series, record_to_row,
                              request_detail_pairs, token_parts, token_quality)
+from cpa_stats.model import (bucket_aggs, export_dict, pick_bucket)
 
 
 def rec(**kw):
@@ -550,3 +551,38 @@ class TestQuotaForecast:
     def test_series(self):
         assert quota_pct_series(hist([(2, 90), (0, 80)]), "weekly_pct") == [90, 80]
         assert quota_pct_series(hist([(2, None), (0, 80)]), "weekly_pct") == [80]
+
+
+class TestTrendBuckets:
+    def test_pick_bucket_snaps_to_ladder(self):
+        b, n = pick_bucket(3600)
+        assert b == 120 and n == 30        # 1h -> 2m buckets
+        b, n = pick_bucket(86400)
+        assert b == 3600 and n == 24       # 24h -> 1h buckets
+        b, n = pick_bucket(7 * 86400)
+        assert b == 21600 and n == 28      # 7d -> 6h buckets
+
+    def test_pick_bucket_long_window(self):
+        b, n = pick_bucket(400 * 86400)
+        assert b >= 86400 and n <= 41
+
+    def test_bucket_aggs(self):
+        rows = [row(), row()]
+        for i, r in enumerate(rows):
+            r["ts"] = 1000.0 + i * 30
+        aggs = bucket_aggs(rows, 1000.0, 60.0, 4)
+        assert len(aggs) == 4
+        assert aggs[0].n == 2
+        assert aggs[1] is None
+        # row ts just past the last bucket is ignored
+        rows[0]["ts"] = 9999.0
+        aggs = bucket_aggs(rows, 1000.0, 60.0, 4)
+        assert sum(a.n for a in aggs if a) == 1
+
+    def test_export_dict(self):
+        d = export_dict(row())
+        assert d["prompt_tokens_total"] == 1000   # 500 new + 400 read + 100 write
+        assert d["uncached_tokens"] == 500
+        assert "raw" not in d
+        assert d["decode_tps"] is not None
+        assert "iso_time" in d

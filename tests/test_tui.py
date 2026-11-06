@@ -179,3 +179,49 @@ async def test_heatmap_tab_and_all_window(db):
         await pilot.press("5")
         await pilot.pause()
         assert "7d" in str(app.query_one("#statusbar").render())
+
+
+@pytest.mark.asyncio
+async def test_trend_tab(db):
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        tc = app.query_one("#right")
+        tc.active = "trend"
+        await pilot.pause()
+        pane = app.query_one("#trend-pane")
+        assert "buckets" in str(pane.render())
+        assert "req" in str(pane.render())
+
+
+@pytest.mark.asyncio
+async def test_model_sort_cycle(db):
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.model_sort_key == "req"
+        await pilot.press("s")
+        await pilot.pause()
+        assert app.model_sort_key == "in"
+        await pilot.press("s")
+        await pilot.pause()
+        assert app.model_sort_key == "out"
+        assert "sort" in str(app.query_one("#statusbar").render())
+
+
+@pytest.mark.asyncio
+async def test_export_key_writes_csv(db, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+        files = list(tmp_path.glob("cpa-stats-*.csv"))
+        assert len(files) == 1
+        head = files[0].read_text().splitlines()
+        assert "decode_tps" in head[0]
+        assert len(head) > 1

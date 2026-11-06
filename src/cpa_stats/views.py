@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import sqlite3
+import sys
 import time
 from datetime import datetime
 
@@ -9,10 +12,11 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
                     bucket_counts, cred_sort_key, decode_tps, e2e_tps, field,
-                    group_by, parse_credentials, parse_iso_ts, quota_forecast,
-                    quota_pace, quota_pct_series, request_detail_pairs,
-                    short_endpoint, short_model, signal_pct_series,
-                    token_parts, recovery_stats)
+                    group_by, bucket_aggs, export_dict, parse_credentials,
+                    parse_iso_ts, pick_bucket, quota_forecast, quota_pace,
+                    quota_pct_series, request_detail_pairs, short_endpoint,
+                    short_model, signal_pct_series, token_parts,
+                    recovery_stats)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -200,6 +204,120 @@ def build_activity(rows, window_s: float, buckets: int = 24):
     line.append(f"  {sum(counts)} req · peak {max(counts)}/{window_s / buckets / 60:.0f}min bucket"
                 f" · {fmt_tok(tok / (window_s / 3600))} tok/h", style="dim")
     return line
+
+
+# ---------------------------------------------------------------------------
+# trend: bucketed metric series (cli `trend`, TUI trend tab)
+
+# metric key -> (column header, Agg -> float|None, value -> str)
+TREND_METRICS = {
+    "req":  ("req",      lambda a: float(a.n),              lambda v: f"{v:.0f}"),
+    "fail": ("fail%",    lambda a: a.failed / a.n * 100 if a.n else None,
+             lambda v: f"{v:.1f}%"),
+    "ttft": ("TTFT p50", lambda a: a.ttft_p50,              lambda v: fmt_ms(v)),
+    "lat":  ("lat p50",  lambda a: a.lat_p50,               lambda v: fmt_ms(v)),
+    "tps":  ("TPS p50",  lambda a: a.tps_p50,               lambda v: fmt_tps(v)),
+    "e2e":  ("e2e p50",  lambda a: a.e2e_p50,               lambda v: fmt_tps(v)),
+    "in":   ("in",       lambda a: float(a.in_tok),         lambda v: fmt_tok(v)),
+    "out":  ("out",      lambda a: float(a.out_tok),        lambda v: fmt_tok(v)),
+    "hit":  ("hit%",     lambda a: (a.cache_ratio * 100
+                                    if a.cache_ratio is not None else None),
+             lambda v: f"{v:.0f}%"),
+    "cost": ("cost",     lambda a: a.cost_usd,              lambda v: fmt_cost(v)),
+}
+
+
+def trend_series(aggs, metric: str) -> list:
+    """Raw values (None for empty buckets) for one metric across buckets."""
+    val = TREND_METRICS[metric][1]
+    return [val(a) if a is not None else None for a in aggs]
+
+
+def trend_lines(aggs, metrics=None) -> list[str]:
+    """'req      ▁▂▃▅ 42' sparkline lines, one per metric, last value shown."""
+    lines = []
+    for m in (metrics or list(TREND_METRICS)):
+        if m not in TREND_METRICS:
+            continue
+        label, _, fmtv = TREND_METRICS[m]
+        series = trend_series(aggs, m)
+        if not any(v is not None for v in series):
+            continue
+        vals = [v if v is not None else 0.0 for v in series]
+        last = next((v for v in reversed(series) if v is not None), None)
+        lines.append(f"{label:>8}  {sparkline(vals)}  "
+                     f"{fmtv(last) if last is not None else '—'}")
+    return lines
+
+
+def cmd_trend(args) -> None:
+    """`cpa-stats trend` — metric sparklines over time buckets."""
+    need_rich()
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    console = Console()
+    span = args.since
+    rows = load_rows(conn, time.time() - span, args.model, args.session,
+                     account=getattr(args, "account", None))
+    bucket_s = float(args.bucket) if args.bucket else None
+    if bucket_s:
+        import math
+        nbuckets = max(1, math.ceil(span / bucket_s))
+    else:
+        bucket_s, nbuckets = pick_bucket(span)
+    if nbuckets > 500:
+        from .collector import die
+        die(f"{nbuckets} buckets is too many — use a larger --bucket "
+            f"(or a smaller --since)")
+    aggs = bucket_aggs(rows, time.time() - span, bucket_s, nbuckets,
+                       getattr(args, "pricing", None))
+    metrics = ([m.strip() for m in args.metric.split(",") if m.strip()]
+               if getattr(args, "metric", None) else list(TREND_METRICS))
+    bad = [m for m in metrics if m not in TREND_METRICS]
+    if bad:
+        from .collector import die
+        die(f"unknown --metric {','.join(bad)} "
+            f"(choices: {','.join(TREND_METRICS)})")
+    since = time.time() - span
+
+    if getattr(args, "json", False):
+        import json as _json
+        out = {
+            "since_s": span, "bucket_s": bucket_s,
+            "buckets": [
+                {"start": since + i * bucket_s,
+                 **({m: trend_series([a], m)[0] for m in metrics} if a
+                    else {m: None for m in metrics})}
+                for i, a in enumerate(aggs)],
+        }
+        print(_json.dumps(out))
+        return
+
+    console.print(Text(
+        f"cpa-stats trend · last {window_label(span)} · "
+        f"{window_label(bucket_s)} buckets · {sum(1 for a in aggs if a)} active",
+        style="bold cyan"))
+    t = Table(box=box.SIMPLE_HEAD, expand=True)
+    t.add_column("bucket", style="dim", no_wrap=True)
+    for m in metrics:
+        t.add_column(TREND_METRICS[m][0], justify="right")
+    for i, a in enumerate(aggs):
+        start = datetime.fromtimestamp(since + i * bucket_s)
+        label = start.strftime("%m-%d") if bucket_s >= 86400 \
+            else start.strftime("%m-%d %H:%M")
+        if a is None:
+            t.add_row(label, *(["·"] * len(metrics)), style="dim")
+            continue
+        cells = []
+        for m in metrics:
+            v = TREND_METRICS[m][1](a)
+            cells.append(TREND_METRICS[m][2](v) if v is not None else "—")
+        t.add_row(label, *cells)
+    console.print(t)
+    lines = trend_lines(aggs, metrics)
+    if lines:
+        console.print(Text("\n".join(lines), style="cyan"))
 
 
 def _quota_eta(history_for_cred):
@@ -605,6 +723,21 @@ def cmd_tail(args) -> None:
         pass
 
 
+def _summary_keyfn(by: str):
+    return {
+        "model": short_model,
+        "session": lambda r: (r["session_id"] or "—"),
+        "account": lambda r: (r["source"] or r["auth_index"] or "—"),
+        "effort": lambda r: f"{short_model(r)} · {r['effort'] or '—'}",
+        "endpoint": lambda r: (r["endpoint"] or "—"),
+        "provider": lambda r: (r["provider"] or "—"),
+        "upstream": lambda r: (r["response_model"] or "—"),
+        "node_kind": lambda r: (field(r, "node_kind") or "—"),
+        "hour": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:00"),
+        "day": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d"),
+    }[by]
+
+
 def cmd_summary(args) -> None:
     need_rich()
     from .storage import open_db_ro
@@ -615,6 +748,31 @@ def cmd_summary(args) -> None:
     rows = load_rows(conn, now - args.since, args.model, args.session,
                      account=getattr(args, "account", None))
     agg = aggregate(rows, args.since, getattr(args, "pricing", None))
+    if getattr(args, "json", False):
+        import dataclasses
+        import json as _json
+
+        def _agg(a):
+            d = dataclasses.asdict(a)
+            d["quality_ratio"] = a.quality_ratio
+            return d
+
+        prev_rows = [r for r in load_rows(conn, now - 2 * args.since,
+                                          args.model, args.session,
+                                          account=getattr(args, "account", None))
+                     if r["ts"] < now - args.since]
+        keyfn = _summary_keyfn(args.by)
+        groups = group_by(rows, keyfn)
+        out = {
+            "since_s": args.since,
+            "aggregate": _agg(agg),
+            "previous": _agg(aggregate(prev_rows, args.since)) if prev_rows else None,
+            "by": args.by,
+            "groups": {name: _agg(aggregate(grp))
+                       for name, grp in groups.items()},
+        }
+        print(_json.dumps(out, default=str))
+        return
     console.print(Text(f"cpa-stats summary · last {window_label(args.since)}", style="bold cyan"))
     console.print(build_cards(agg, window_label(args.since)))
     prev_rows = [r for r in load_rows(conn, now - 2 * args.since,
@@ -646,18 +804,7 @@ def cmd_summary(args) -> None:
             f"lat p50 {fmt_ms(agg.lat_p50)} "
             f"({d(agg.lat_p50 or 0, prev.lat_p50 or 0)})",
             style="dim"))
-    keyfn = {
-        "model": short_model,
-        "session": lambda r: (r["session_id"] or "—"),
-        "account": lambda r: (r["source"] or r["auth_index"] or "—"),
-        "effort": lambda r: f"{short_model(r)} · {r['effort'] or '—'}",
-        "endpoint": lambda r: (r["endpoint"] or "—"),
-        "provider": lambda r: (r["provider"] or "—"),
-        "upstream": lambda r: (r["response_model"] or "—"),
-        "node_kind": lambda r: (field(r, "node_kind") or "—"),
-        "hour": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:00"),
-        "day": lambda r: datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d"),
-    }[args.by]
+    keyfn = _summary_keyfn(args.by)
     t = Table(box=box.SIMPLE_HEAD, title=f"by {args.by}", title_style="bold cyan",
               title_justify="left")
     for col, just in (
@@ -757,6 +904,10 @@ def cmd_quota(args) -> None:
     snap = snap or load_quota_snapshot(conn)
     console = Console()
     if not snap or not isinstance(snap.get("files"), list):
+        if getattr(args, "json", False):
+            import json as _json
+            print(_json.dumps({"fetched_at": None, "credentials": []}))
+            return
         console.print(Text(
             "no credential snapshot yet — restart `cpa-stats collect` "
             "(it stores /management/credentials every --quota-interval seconds)",
@@ -764,6 +915,14 @@ def cmd_quota(args) -> None:
         return
     creds = parse_credentials(snap)
     fetched = snap.get("fetched_at")
+    if getattr(args, "json", False):
+        import dataclasses
+        import json as _json
+        print(_json.dumps({"fetched_at": fetched,
+                           "credentials": [dataclasses.asdict(c)
+                                           for c in creds]},
+                          default=str))
+        return
     console.print(Text(
         f"cpa-stats quota · {len(creds)} credential(s)"
         + (f" · snapshot {fmt_age(time.time() - fetched)}" if fetched else ""),
@@ -887,6 +1046,16 @@ def cmd_show(args) -> None:
     if not row:
         console.print(Text(f"no request matching '{rid}'", style="red"))
         raise SystemExit(1)
+    if getattr(args, "json", False):
+        import json as _json
+
+        d = {k: row[k] for k in row.keys()}
+        try:
+            d["raw"] = _json.loads(d["raw"]) if d.get("raw") else None
+        except ValueError:
+            pass
+        print(_json.dumps(d, ensure_ascii=False, default=str))
+        return
     from rich.markup import escape
 
     t = Table(box=box.SIMPLE_HEAD, show_header=False, title="request detail",
@@ -915,6 +1084,28 @@ def cmd_errors(args) -> None:
     rows = load_rows(conn, time.time() - args.since, args.model, args.session,
                      account=getattr(args, "account", None))
     fails = [r for r in rows if r["failed"]]
+    groups = group_by(fails, lambda r: (
+        short_model(r), r["status_code"] or 0, field(r, "fail_code") or "",
+        r["endpoint"] or ""))
+    if getattr(args, "json", False):
+        import json as _json
+
+        rec = recovery_stats(rows)
+        out = {
+            "since_s": args.since,
+            "requests": len(rows), "failed": len(fails),
+            "recovery": ({"median_s": rec[0], "share_within_5m": rec[1]}
+                         if rec else None),
+            "groups": [
+                {"model": m, "status": s, "code": c, "endpoint": ep,
+                 "count": len(grp),
+                 "last_ts": max(r["ts"] for r in grp),
+                 "sample": next((r["error"] for r in grp if r["error"]) or "")[:300]}
+                for (m, s, c, ep), grp in sorted(
+                    groups.items(), key=lambda kv: -len(kv[1]))],
+        }
+        print(_json.dumps(out, default=str))
+        return
     console.print(Text(
         f"cpa-stats errors · last {window_label(args.since)} · "
         f"{len(fails)}/{len(rows)} failed"
@@ -930,9 +1121,6 @@ def cmd_errors(args) -> None:
             f"recovery: median {fmt_ms(int(med * 1000))} until the same model "
             f"succeeds again · {share * 100:.0f}% recover within 5m",
             style="dim"))
-    groups = group_by(fails, lambda r: (
-        short_model(r), r["status_code"] or 0, field(r, "fail_code") or "",
-        r["endpoint"] or ""))
     t = Table(box=box.SIMPLE_HEAD, expand=True, title="by model · status · code · endpoint",
               title_style="bold red", title_justify="left")
     for col, just in (("model", "left"), ("status", "right"), ("code", "left"),
@@ -971,6 +1159,18 @@ def cmd_top(args) -> None:
     idx = {"tokens": 1, "output": 2, "cost": 3, "latency": 4}[args.by]
     scored.sort(key=lambda t: (t[idx] is None, -(t[idx] or 0)))
     top = scored[:args.limit]
+    if getattr(args, "json", False):
+        import json as _json
+
+        out = []
+        for r, tot, out_tok, cost, lat in top:
+            d = export_dict(r)
+            d.pop("raw", None)
+            d["cost_usd"] = cost
+            out.append(d)
+        print(_json.dumps({"since_s": args.since, "by": args.by,
+                           "rows": out}, default=str))
+        return
     if args.by == "cost" and not (pricing and pricing.enabled):
         console.print(Text(
             "hint: pass --price in,cached,out to sort by estimated cost",
@@ -1037,14 +1237,195 @@ def cmd_alert(args) -> None:
         print(f"{name}: {', '.join(active) if active else 'clear'}")
 
 
+def cmd_sql(args) -> None:
+    """`cpa-stats sql` — ad-hoc read-only SQL against the requests db."""
+    import csv as _csv
+    import json as _json
+
+    from .collector import die
+    from .storage import open_db_ro
+
+    stmt = args.query.strip().rstrip(";")
+    first = re.split(r"\s+", stmt, maxsplit=1)[0].upper() if stmt else ""
+    if first not in ("SELECT", "WITH", "EXPLAIN", "PRAGMA"):
+        die("only read-only queries are allowed (SELECT / WITH / EXPLAIN / PRAGMA)")
+    conn = open_db_ro(args.db)
+    try:
+        cur = conn.execute(stmt)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = cur.fetchmany(max(1, args.limit))
+    except sqlite3.Error as exc:
+        die(f"query failed: {exc}")
+    if args.format == "json":
+        print(_json.dumps(
+            [{c: r[c] for c in cols} for r in rows], default=str))
+        return
+    if args.format == "csv":
+        w = _csv.writer(sys.stdout)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r[c] for c in cols])
+        return
+    need_rich()
+    console = Console()
+    t = Table(box=box.SIMPLE_HEAD, expand=True)
+    for c in cols:
+        t.add_column(c, overflow="fold")
+    for r in rows:
+        t.add_row(*(str(r[c]) if r[c] is not None else "" for c in cols))
+    console.print(t)
+    if len(rows) == args.limit:
+        console.print(Text(f"… truncated at --limit {args.limit}", style="dim"))
+
+
+def report_lines(conn, args) -> list[str]:
+    """Compact digest lines — `report` and `--webhook` share this text."""
+    rows = load_rows(conn, time.time() - args.since, args.model, args.session,
+                     account=getattr(args, "account", None))
+    agg = aggregate(rows, args.since, getattr(args, "pricing", None))
+    ok = agg.n - agg.failed
+    lines = [
+        f"cpa-stats report · last {window_label(args.since)} · "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"requests  {agg.n} · {ok} ok · {agg.failed} failed"
+        + (f" ({agg.failed / agg.n * 100:.1f}%)" if agg.n else ""),
+        f"tokens    in {fmt_tok(agg.in_tok)} (new {fmt_tok(agg.uncached)}"
+        f" · cached {fmt_tok(agg.cache_read + agg.cache_write)}"
+        f" · hit {fmt_pct(agg.cache_ratio)}) · out {fmt_tok(agg.out_tok)}",
+        f"speed     TTFT p50 {fmt_ms(agg.ttft_p50)}"
+        f" · lat p50 {fmt_ms(agg.lat_p50)} · p95 {fmt_ms(agg.lat_p95)}"
+        f" · TPS p50 {fmt_tps(agg.tps_p50)} · e2e {fmt_tps(agg.e2e_p50)}",
+    ]
+    if agg.cost_usd is not None:
+        lines.append(f"est. cost {fmt_cost(agg.cost_usd)}")
+    models = sorted(group_by(rows, short_model).items(),
+                    key=lambda kv: -len(kv[1]))[:4]
+    if models:
+        lines.append("models    " + " · ".join(
+            f"{name} {len(g)}" for name, g in models))
+    fails = [r for r in rows if r["failed"]]
+    if fails:
+        codes = group_by(fails, lambda r: str(r["status_code"] or "err")
+                         + (f"/{field(r, 'fail_code')}"
+                            if field(r, "fail_code") else ""))
+        top = sorted(codes.items(), key=lambda kv: -len(kv[1]))[:4]
+        lines.append("errors    " + " · ".join(
+            f"{c}×{len(g)}" for c, g in top))
+    snap = load_quota_snapshot(conn)
+    creds = parse_credentials(snap)
+    if creds:
+        hist = group_by(load_quota_history(conn), lambda r: r["name"])
+        bits = []
+        for c in sorted(creds, key=cred_sort_key)[:4]:
+            b = c.account
+            for pct_, lab in ((c.daily_pct, c.daily_label),
+                              (c.weekly_pct, c.weekly_label)):
+                if pct_ is not None:
+                    b += f" {lab} {pct_}%"
+            if c.blocked:
+                b += " BLOCKED"
+            elif c.limited:
+                b += " limited"
+            eta = _quota_eta(hist.get(c.name))
+            if eta:
+                b += f" ({eta})"
+            bits.append(b)
+        lines.append("quota     " + " · ".join(bits))
+    return lines
+
+
+def cmd_report(args) -> None:
+    """`cpa-stats report` — digest for humans or webhook consumers."""
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    text = "\n".join(report_lines(conn, args))
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({"report": text}))
+        return
+    if getattr(args, "webhook", None):
+        from .collector import send_webhook
+        send_webhook(args.webhook, text)
+        print(f"posted report to {args.webhook[:60]}…")
+        return
+    need_rich()
+    Console().print(text)
+
+
 def make_serve_server(args):
     """`cpa-stats serve` — read-only web dashboard with meta-refresh."""
     need_rich()
+    import dataclasses
     import json as _json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from .model import COLUMNS
     from .storage import open_db_ro
+
+    def metrics_text(conn) -> str:
+        """Prometheus exposition format, read straight from the db."""
+        def esc(v):
+            return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+        def labels(**kv):
+            return "{" + ",".join(f'{k}="{esc(v)}"' for k, v in kv.items()) + "}"
+
+        out = ["# HELP cpa_stats_requests_total Requests stored",
+               "# TYPE cpa_stats_requests_total counter"]
+        tot = db_totals(conn, getattr(args, "pricing", None))
+        out.append(f"cpa_stats_requests_total {tot.n}")
+        out.append(f"cpa_stats_request_failures_total {tot.failed}")
+        for kind, val in (("input", tot.in_tok), ("uncached", tot.uncached),
+                          ("cache_read", tot.cache_read),
+                          ("cache_write", tot.cache_write),
+                          ("output", tot.out_tok),
+                          ("reasoning", tot.reasoning_tok)):
+            out.append(f'cpa_stats_tokens_total{{kind="{kind}"}} {val}')
+        if tot.cache_ratio is not None:
+            out.append(f"cpa_stats_cache_hit_ratio {tot.cache_ratio:.6f}")
+        hb = meta_get(conn, "collector_heartbeat")
+        age = time.time() - float(hb) if hb else None
+        out.append(f"cpa_stats_collector_up {1 if age is not None and age < 15 else 0}")
+        if age is not None:
+            out.append(f"cpa_stats_collector_heartbeat_age_seconds {age:.1f}")
+        seen = set()
+        for win in sorted({int(args.window), 3600, 86400, 604800}):
+            tag = window_label(win)
+            if tag in seen:
+                continue
+            seen.add(tag)
+            rows = load_rows(conn, time.time() - win,
+                             getattr(args, "model", None),
+                             getattr(args, "session", None),
+                             account=getattr(args, "account", None))
+            a = aggregate(rows, win, getattr(args, "pricing", None))
+            lb = labels(window=tag)
+            out.append(f'cpa_stats_window_requests{lb} {a.n}')
+            out.append(f'cpa_stats_window_failures{lb} {a.failed}')
+            for name, val in (("ttft_p50_ms", a.ttft_p50),
+                              ("ttft_p95_ms", a.ttft_p95),
+                              ("latency_p50_ms", a.lat_p50),
+                              ("latency_p95_ms", a.lat_p95),
+                              ("tps_p50", a.tps_p50),
+                              ("e2e_tps_p50", a.e2e_p50)):
+                if val is not None:
+                    out.append(f"cpa_stats_window_{name}{lb} {val:.2f}")
+        snap = load_quota_snapshot(conn)
+        if snap:
+            for c in parse_credentials(snap):
+                lb = labels(credential=c.name, account=c.account,
+                            provider=c.provider or "?")
+                for wname, pct_ in ((c.daily_label or "daily", c.daily_pct),
+                                    (c.weekly_label or "weekly", c.weekly_pct)):
+                    if pct_ is not None:
+                        out.append(
+                            f'cpa_stats_quota_remaining_percent'
+                            f'{labels(credential=c.name, account=c.account, window=wname)}'
+                            f' {pct_}')
+                out.append(f"cpa_stats_quota_blocked{lb} {1 if c.blocked else 0}")
+                out.append(f"cpa_stats_quota_limited{lb} {1 if c.limited else 0}")
+        return "\n".join(out) + "\n"
 
     class H(BaseHTTPRequestHandler):
         def _send(self, body, ctype="text/html; charset=utf-8", code=200):
@@ -1087,6 +1468,61 @@ def make_serve_server(args):
                         conn.close()
                     return self._send(_json.dumps(out, default=str),
                                       "application/json")
+                if path == "/api/summary":
+                    conn = open_db_ro(args.db)
+                    try:
+                        rows = load_rows(conn, time.time() - args.window,
+                                         args.model, args.session,
+                                         account=getattr(args, "account", None))
+                        agg = aggregate(rows, args.window,
+                                        getattr(args, "pricing", None))
+                        d = dataclasses.asdict(agg)
+                        d["quality_ratio"] = agg.quality_ratio
+                        d["window_s"] = args.window
+                        d["totals"] = dataclasses.asdict(
+                            db_totals(conn, getattr(args, "pricing", None)))
+                    finally:
+                        conn.close()
+                    return self._send(_json.dumps(d, default=str),
+                                      "application/json")
+                if path == "/api/quota":
+                    conn = open_db_ro(args.db)
+                    try:
+                        snap = load_quota_snapshot(conn) or {}
+                        creds = [dataclasses.asdict(c)
+                                 for c in parse_credentials(snap)]
+                        out = {"fetched_at": snap.get("fetched_at"),
+                               "credentials": creds}
+                    finally:
+                        conn.close()
+                    return self._send(_json.dumps(out, default=str),
+                                      "application/json")
+                if path == "/api/errors":
+                    conn = open_db_ro(args.db)
+                    try:
+                        rows = load_rows(conn, time.time() - args.window,
+                                         args.model, args.session,
+                                         account=getattr(args, "account", None))
+                        fails = [r for r in rows if r["failed"]]
+                        groups = group_by(fails, lambda r: (
+                            short_model(r), r["status_code"] or 0,
+                            field(r, "fail_code") or "", r["endpoint"] or ""))
+                        out = [{"model": m, "status": s, "code": c,
+                                "endpoint": ep, "count": len(grp),
+                                "last_ts": max(r["ts"] for r in grp)}
+                               for (m, s, c, ep), grp in
+                               sorted(groups.items(), key=lambda kv: -len(kv[1]))]
+                    finally:
+                        conn.close()
+                    return self._send(_json.dumps(out, default=str),
+                                      "application/json")
+                if path == "/metrics":
+                    conn = open_db_ro(args.db)
+                    try:
+                        body = metrics_text(conn)
+                    finally:
+                        conn.close()
+                    return self._send(body, "text/plain; version=0.0.4")
                 self._send("not found", "text/plain", 404)
             except Exception as exc:  # noqa: BLE001
                 self._send(f"error: {exc}", "text/plain", 500)

@@ -11,13 +11,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .storage import (insert_records, meta_set, open_db, prune,
-                      load_quota_history, meta_get, meta_set, open_db, prune,
-                      save_quota_history, save_quota_snapshot)
+from .storage import (insert_records, load_quota_history, meta_get, meta_set,
+                      open_db, prune, save_quota_history, save_quota_snapshot)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -321,6 +321,58 @@ def check_quota_alerts(conn, creds, args, log) -> None:
                 log(f"alert webhook failed: {exc}")
 
 
+def check_request_alerts(conn, recent: deque, args, log) -> None:
+    """Rolling failure-rate spike alert over the request stream itself.
+
+    `recent` is a deque of (ts, failed, model) for the last
+    --alert-fail-window seconds of stored records. Fires once when the share
+    of failures crosses --alert-fail-pct (given at least --alert-fail-min
+    requests), and once again on recovery. State rides along in
+    meta.alert_state under "requests".
+    """
+    webhook = getattr(args, "alert_webhook", None)
+    if not webhook:
+        return
+    win_s = float(getattr(args, "alert_fail_window", 600.0))
+    min_n = int(getattr(args, "alert_fail_min", 10))
+    limit = float(getattr(args, "alert_fail_pct", 25.0))
+    now = time.time()
+    while recent and recent[0][0] < now - win_s:
+        recent.popleft()
+    n = len(recent)
+    fails = sum(1 for _t, f, _m in recent if f)
+    ratio = fails / n * 100 if n else 0.0
+    try:
+        state = json.loads(meta_get(conn, "alert_state") or "{}")
+        if not isinstance(state, dict):
+            state = {}
+    except ValueError:
+        state = {}
+    st = state.setdefault("requests", {})
+    spiking = n >= min_n and ratio >= limit
+    events: list[str] = []
+    mins = max(1, int(win_s / 60))
+    if spiking and not st.get("fail_spike"):
+        top = Counter(m for _t, f, m in recent if f).most_common(3)
+        events.append(
+            f"🔥 cpa-stats: {ratio:.0f}% of {n} requests failed in {mins}m"
+            + (f" (top: {', '.join(f'{m}×{k}' for m, k in top)})" if top else ""))
+        st["fail_spike"] = True
+    elif not spiking and st.get("fail_spike"):
+        events.append(f"✅ cpa-stats: failure rate back to {ratio:.0f}% "
+                      f"({fails}/{n} in {mins}m)")
+        st["fail_spike"] = False
+    if not events:
+        return
+    meta_set(conn, "alert_state", json.dumps(state))
+    for e in events:
+        try:
+            send_webhook(webhook, e)
+            log(f"alert sent: {e[:100]}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"alert webhook failed: {exc}")
+
+
 def cmd_collect(args) -> None:
     cfgs = load_cpa_configs(args)
     db_path = Path(args.db)
@@ -361,6 +413,7 @@ def cmd_collect(args) -> None:
     quota_every = max(float(args.quota_interval), 0.0)
     last_quota = 0.0
     quota_err = None
+    recent_reqs: deque = deque()  # (ts, failed, model) for fail-spike alerts
     while not stop["flag"]:
         got = 0
         errs = []
@@ -372,6 +425,12 @@ def cmd_collect(args) -> None:
                         break
                     try:
                         got += insert_records(conn, recs)
+                        if args.alert_webhook:
+                            now_r = time.time()
+                            for r in recs:
+                                recent_reqs.append(
+                                    (now_r, bool(r.get("failed")),
+                                     str(r.get("model") or r.get("alias") or "?")))
                     except Exception as exc:  # never lose popped data
                         with spool.open("a") as fh:
                             for r in recs:
@@ -411,6 +470,11 @@ def cmd_collect(args) -> None:
                 log("recovered")
                 last_error = None
             backoff = args.interval
+        if args.alert_webhook:
+            try:
+                check_request_alerts(conn, recent_reqs, args, log)
+            except Exception as exc:  # noqa: BLE001
+                log(f"request alert check failed: {exc}")
         if quota_every and time.time() - last_quota >= quota_every:
             try:
                 now = time.time()
