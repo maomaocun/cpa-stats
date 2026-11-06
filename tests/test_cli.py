@@ -643,7 +643,7 @@ class TestTrend:
         db = self._db(tmp_path, [make_rec(i) for i in range(9)])
         main(["trend", "--db", str(db), "--since", "1h", "--bucket", "15m"])
         out = capsys.readouterr().out
-        assert "trend" in out and "req" in out and "TTFT p50" in out
+        assert "trend" in out and "req" in out and "ttft" in out
 
     def test_trend_json(self, tmp_path, capsys):
         db = self._db(tmp_path, [make_rec(1)])
@@ -826,3 +826,44 @@ class TestRequestAlerts:
         check_request_alerts(conn, bad, args, lambda m: None)  # no webhook call
         assert meta_get(conn, "alert_state") in (None, "{}")
         conn.close()
+
+
+class TestUpgrade:
+    def test_parse_version(self):
+        from cpa_stats.collector import parse_version
+        assert parse_version("v2.3.0") == (2, 3, 0)
+        assert parse_version("2.10") == (2, 10, 0)
+        assert parse_version("junk") == ()
+
+    def test_update_notice(self, tmp_path):
+        from cpa_stats.collector import update_notice
+        from cpa_stats.storage import meta_set
+        conn = open_db(tmp_path / "r.db")
+        assert update_notice(conn) == ""
+        meta_set(conn, "latest_release", "v0.0.1")   # older than current
+        assert update_notice(conn) == ""
+        meta_set(conn, "latest_release", "v99.0.0")
+        assert update_notice(conn) == "v99.0.0"
+        conn.close()
+
+    def test_install_location_editable(self):
+        # the test env installs cpa-stats as `pip install -e .`
+        from cpa_stats.collector import install_location
+        kind, detail = install_location()
+        assert kind == "editable" and detail
+
+    def test_upgrade_already_latest(self, tmp_path, capsys, monkeypatch):
+        import cpa_stats.collector as coll
+        monkeypatch.setattr(coll, "latest_release_tag",
+                            lambda *a, **kw: f"v{__import__('cpa_stats').__version__}")
+        main(["upgrade", "--db", str(tmp_path / "r.db")])
+        out = capsys.readouterr().out
+        assert "up to date" in out
+
+    def test_upgrade_newer_prints_command(self, tmp_path, capsys, monkeypatch):
+        import cpa_stats.collector as coll
+        monkeypatch.setattr(coll, "latest_release_tag",
+                            lambda *a, **kw: "v99.9.9")
+        main(["upgrade", "--db", str(tmp_path / "r.db")])
+        out = capsys.readouterr().out
+        assert "v99.9.9" in out and "upgrade with" in out

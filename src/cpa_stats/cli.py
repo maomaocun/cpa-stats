@@ -166,6 +166,20 @@ def cmd_doctor(args) -> None:
             line(False, f"collector last error: {err.partition('|')[2]}")
     else:
         line(False, f"database {db} does not exist yet (start the collector)")
+    try:
+        from .collector import latest_release_tag, parse_version
+
+        tag = latest_release_tag()
+        if tag and parse_version(tag) > parse_version(__version__):
+            line(False, f"cpa-stats {__version__} is behind {tag} "
+                        f"— run `cpa-stats upgrade`")
+        elif tag:
+            line(True, f"cpa-stats {__version__} (latest release)")
+        else:
+            line(True, f"cpa-stats {__version__} "
+                       "(release check unreachable — offline?)")
+    except Exception:  # noqa: BLE001 — informational only
+        pass
     sys.exit(0 if ok else 1)
 
 
@@ -206,6 +220,47 @@ WantedBy=default.target
                 print(f"systemctl failed ({exc}); enable manually: systemctl --user enable --now cpa-stats",
                       file=sys.stderr)
                 break
+
+
+def cmd_upgrade(args) -> None:
+    """`cpa-stats upgrade` — check GitHub for a newer release, optionally apply."""
+    from .collector import (DEFAULT_REPO, install_location, latest_release_tag,
+                            parse_version)
+
+    kind, detail = install_location()
+    print(f"cpa-stats {__version__} ({kind})")
+    tag = getattr(args, "tag", None) or latest_release_tag()
+    if not tag:
+        print(f"cannot determine latest release "
+              f"(github.com/{DEFAULT_REPO} unreachable or no releases yet)")
+        sys.exit(1)
+    print(f"latest release: {tag}")
+    new = parse_version(tag)
+    if new and new <= parse_version(__version__):
+        print("already up to date")
+        return
+    if kind == "editable" and detail:
+        steps = [["git", "-C", detail, "pull", "--ff-only"],
+                 [sys.executable, "-m", "pip", "install", "--user", "-e", detail]]
+        hint = " && ".join(" ".join(s) for s in steps)
+    elif kind == "pipx":
+        steps = [["pipx", "upgrade", "cpa-stats"]]
+        hint = "pipx upgrade cpa-stats"
+    else:
+        spec = f"git+https://github.com/{DEFAULT_REPO}@{tag}"
+        steps = [[sys.executable, "-m", "pip", "install", "--user",
+                  "--upgrade", spec]]
+        hint = f"pip install --user --upgrade '{spec}'"
+    if not args.apply:
+        print(f"upgrade with: {hint}")
+        return
+    for step in steps:
+        print("+ " + " ".join(step))
+        try:
+            subprocess.run(step, check=True)
+        except subprocess.CalledProcessError as exc:
+            die(f"upgrade step failed ({exc.returncode}); fix and retry")
+    print("done — restart `cpa-stats collect` (and any `tui`) to pick it up")
 
 
 def add_price_arg(p):
@@ -429,6 +484,15 @@ def main(argv=None) -> None:
     i.add_argument("--retention-days", type=float, default=90)
     i.add_argument("--no-enable", action="store_true", help="write the unit but don't enable it")
     i.set_defaults(func=cmd_install_service)
+
+    u = sub.add_parser("upgrade", parents=[common],
+                       help="check for a newer release and print/run the upgrade")
+    u.add_argument("--apply", action="store_true",
+                   help="run the upgrade (git pull / pip / pipx depending on "
+                        "how cpa-stats was installed)")
+    u.add_argument("--tag", help="target tag instead of querying GitHub "
+                        "(e.g. v2.3.0)")
+    u.set_defaults(func=cmd_upgrade)
 
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):

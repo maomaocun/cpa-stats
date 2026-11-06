@@ -577,6 +577,14 @@ def render_dashboard(conn, args, console):
         title.append(f" · acct~{args.account}", style="magenta")
     right = Text()
     right.append_text(status)
+    try:
+        from .collector import update_notice
+
+        upd = update_notice(conn)
+        if upd:
+            right.append(f"  ↑ {upd}", style="bold yellow")
+    except Exception:  # noqa: BLE001
+        pass
     right.append(f"   {total} stored · {datetime.now().strftime('%H:%M:%S')}", style="dim")
     header.add_row(title, right)
 

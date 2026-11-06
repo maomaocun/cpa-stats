@@ -24,6 +24,17 @@ cpa-stats doctor        # sanity-check CPA endpoint, key, collector, db
 
 Requires Python ≥ 3.10 and `rich`.
 
+Tagged releases (`git tag vX.Y.Z && git push --tags`) run the release
+workflow: tests on 3.10–3.12, then a GitHub Release with the sdist + wheel.
+Install straight from a tag (`pipx install
+git+https://github.com/maomaocun/cpa-stats@v2.3.0`) or download the wheel
+from the release page. `cpa-stats upgrade` checks the latest release
+against the running version and `--apply` runs the right upgrade for the
+install type (editable → `git pull --ff-only` + `pip install -e`, pipx →
+`pipx upgrade`, pip → `pip install --user -U git+…@tag`). The collector
+re-checks the newest release once a day; `watch`/`tui`/`doctor` show a
+`↑ vX.Y.Z` hint when you're behind.
+
 ## Quick start
 
 ```bash

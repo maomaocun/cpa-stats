@@ -369,6 +369,7 @@ def build_app():
             sb.update(
                 f"{coll}   window [bold]{WINDOWS[self.window_key][0]}[/]"
                 f"   {totals.n} stored"
+                + (f"   [yellow]↑ {upd}[/]" if (upd := _update(self.conn)) else "")
                 + _quota_chip(self.creds)
                 + (f"   sort [bold]{self.model_sort_key}[/]"
                    if self.model_sort_key != "req" else "")
@@ -731,6 +732,16 @@ def _fmt_reset(ts):
     if delta > 0:
         return fmt_countdown(delta)
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def _update(conn) -> str:
+    """Newer released tag from meta (collector refreshes it daily), else ''."""
+    try:
+        from .collector import update_notice
+
+        return update_notice(conn)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _quota_chip(creds) -> str:

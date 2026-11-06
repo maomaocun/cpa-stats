@@ -123,6 +123,84 @@ CREDENTIALS_REFRESH_PATHS = (
 # ProviderSupportsQuotaObservation upstream).
 QUOTA_PROVIDERS = {"claude", "codex", "devin"}
 
+# Where releases/tags are published (env override for forks).
+DEFAULT_REPO = os.environ.get("CPA_STATS_REPO", "maomaocun/cpa-stats")
+
+
+def parse_version(text) -> tuple:
+    """'v2.3.0' / '2.3.0' -> (2, 3, 0); unparseable -> ()."""
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(text or ""))
+    if not m:
+        return ()
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def latest_release_tag(repo: str | None = None, timeout: float = 5.0):
+    """Newest GitHub release (falls back to the newest tag) -> 'vX.Y.Z' or None.
+
+    Honors http(s)_proxy — this is an external call, unlike management API."""
+    repo = repo or DEFAULT_REPO
+    from . import __version__
+
+    opener = urllib.request.build_opener()  # proxy env vars honored
+    for path in (f"/repos/{repo}/releases/latest", f"/repos/{repo}/tags"):
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"cpa-stats/{__version__}"})
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read() or b"{}")
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("tag_name"):
+            return str(data["tag_name"])
+        if isinstance(data, list) and data and isinstance(data[0], dict) \
+                and data[0].get("name"):
+            return str(data[0]["name"])
+    return None
+
+
+def install_location():
+    """(kind, detail) — 'editable':repo dir, 'pipx':exe, 'pip':location,
+    'unknown':exe."""
+    try:
+        from importlib.metadata import distributions
+
+        pip_loc = None
+        for dist in distributions():
+            if (dist.metadata.get("Name") or "").lower() != "cpa-stats":
+                continue
+            loc = str(dist.locate_file(""))
+            if "/pipx/venvs/" in loc:
+                return ("pipx", loc)
+            raw = dist.read_text("direct_url.json")
+            if raw:
+                d = json.loads(raw)
+                if d.get("dir_info", {}).get("editable"):
+                    url = str(d.get("url") or "")
+                    return ("editable", url.removeprefix("file://"))
+            # stale build metadata (src/*.egg-info) lacks direct_url — keep
+            # scanning so the real site-packages dist-info still wins.
+            pip_loc = pip_loc or loc
+        if pip_loc:
+            return ("pip", pip_loc)
+    except Exception:  # noqa: BLE001
+        pass
+    import shutil
+    return ("unknown", shutil.which("cpa-stats") or "")
+
+
+def update_notice(conn) -> str:
+    """Newer released tag stored in meta by the collector, else ''."""
+    tag = meta_get(conn, "latest_release")
+    if not tag:
+        return ""
+    from . import __version__
+
+    cur, new = parse_version(__version__), parse_version(tag)
+    return str(tag) if new and cur and new > cur else ""
+
 # Endpoint-version probe caches, keyed by instance url — instances may run
 # different CPA builds, so a global cache would ping-pong and force a wasted
 # 404 probe on every poll.
@@ -414,6 +492,7 @@ def cmd_collect(args) -> None:
     last_quota = 0.0
     quota_err = None
     recent_reqs: deque = deque()  # (ts, failed, model) for fail-spike alerts
+    last_release_check = 0.0
     while not stop["flag"]:
         got = 0
         errs = []
@@ -452,11 +531,20 @@ def cmd_collect(args) -> None:
         total += got
         if got and args.verbose:
             log(f"stored {got} records (total {total})")
+        tag = None
+        if time.time() - last_release_check > 86400:
+            last_release_check = time.time()
+            try:
+                tag = latest_release_tag()
+            except Exception:  # noqa: BLE001 — offline is fine
+                tag = None
         try:
             with conn:
                 meta_set(conn, "collector_heartbeat", time.time())
                 meta_set(conn, "collector_last_error",
                          f"{time.time()}|{errs[0]}" if errs else "")
+                if tag:
+                    meta_set(conn, "latest_release", tag)
         except sqlite3.Error:
             pass
         if errs:
