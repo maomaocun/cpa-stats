@@ -127,48 +127,6 @@ QUOTA_PROVIDERS = {"claude", "codex", "devin"}
 DEFAULT_REPO = os.environ.get("CPA_STATS_REPO", "maomaocun/cpa-stats")
 
 
-def proxy_opener(auto_local: bool = True):
-    """url opener for external (GitHub/webhook) traffic.
-
-    Honors CPA_STATS_PROXY first, then the standard https_proxy/HTTPS_PROXY
-    env vars. With auto_local (default), a listening clash/mihomo-style
-    proxy on 127.0.0.1:7890 is also auto-used — handy for slow GitHub
-    downloads. Callers hitting internal webhooks should pass
-    auto_local=False so env vars are honored but no local proxy is
-    assumed.
-    """
-    proxy = (os.environ.get("CPA_STATS_PROXY")
-             or os.environ.get("https_proxy")
-             or os.environ.get("HTTPS_PROXY"))
-    if not proxy and auto_local:
-        import socket
-
-        try:
-            with socket.create_connection(("127.0.0.1", 7890), timeout=0.5):
-                proxy = "http://127.0.0.1:7890"
-        except OSError:
-            proxy = None
-    if proxy:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    return urllib.request.build_opener()
-
-
-def send_webhook(url: str, text: str, timeout: float = 10.0) -> None:
-    """POST a text alert. The payload carries both a generic `text` field and
-    the Lark bot webhook shape (`msg_type`/`content`), so either consumer
-    accepts it. Unlike management calls, webhooks DO honor http(s)_proxy
-    env vars — but no local proxy is auto-detected (alerts may point at
-    internal endpoints)."""
-    body = json.dumps({"msg_type": "text", "content": {"text": text},
-                       "text": text}, ensure_ascii=False).encode()
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/json"})
-    with proxy_opener(auto_local=False).open(req, timeout=timeout) as resp:
-        resp.read()
-
-
 def parse_version(text) -> tuple:
     """'v2.3.0' / '2.3.0' -> (2, 3, 0); unparseable -> ()."""
     m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(text or ""))
@@ -184,7 +142,7 @@ def latest_release_tag(repo: str | None = None, timeout: float = 5.0):
     repo = repo or DEFAULT_REPO
     from . import __version__
 
-    opener = proxy_opener()
+    opener = urllib.request.build_opener()  # standard env proxies honored
     for path in (f"/repos/{repo}/releases/latest", f"/repos/{repo}/tags"):
         req = urllib.request.Request(
             f"https://api.github.com{path}",
@@ -262,7 +220,7 @@ def download_to(url: str, dest) -> None:
 
     dest = Path(dest)
     req = urllib.request.Request(url, headers={"User-Agent": "cpa-stats"})
-    with proxy_opener().open(req, timeout=60) as resp, \
+    with urllib.request.build_opener().open(req, timeout=60) as resp, \
             tempfile.NamedTemporaryFile(
                 dir=str(dest.parent), prefix=dest.name + ".",
                 delete=False) as tmp:
@@ -397,6 +355,20 @@ def stale_quota_credentials(snap: dict, max_age_s: float, now: float) -> list[st
             if name:
                 stale.append(str(name))
     return stale
+
+
+def send_webhook(url: str, text: str, timeout: float = 10.0) -> None:
+    """POST a text alert. The payload carries both a generic `text` field and
+    the Lark bot webhook shape (`msg_type`/`content`), so either consumer
+    accepts it. Unlike management calls, webhooks DO honor http(s)_proxy env
+    vars — they are typically external endpoints."""
+    body = json.dumps({"msg_type": "text", "content": {"text": text},
+                       "text": text}, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.build_opener().open(req, timeout=timeout) as resp:
+        resp.read()
 
 
 def check_quota_alerts(conn, creds, args, log) -> None:

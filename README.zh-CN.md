@@ -44,9 +44,10 @@ upgrade`;pip → `pip install --user -U git+…@tag`)。collector 每天
 重新检查一次最新 release;落后时 `watch` / `tui` / `doctor` 会显示
 `↑ vX.Y.Z` 提示。
 
-访问 GitHub 的流量走代理:`CPA_STATS_PROXY` 环境变量优先,其次
-`https_proxy` / `HTTPS_PROXY`;都没设但本机 127.0.0.1:7890 有代理在
-监听时自动使用(clash/mihomo 常见端口)。CPA 管理 API 的调用永远直连。
+`install.sh` 访问 GitHub 可以走代理:`CPA_STATS_PROXY` 环境变量优先,
+其次 `https_proxy` / `HTTPS_PROXY`;都没设但本机 127.0.0.1:7890 有
+代理在监听时自动使用(clash/mihomo 常见端口)。包代码本身不做任何
+代理处理——urllib 默认认标准 env。
 
 ## 快速上手
 

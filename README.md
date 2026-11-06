@@ -22,6 +22,8 @@ cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota 
 ```bash
 # one-liner: standalone binary if your platform has one, else pipx/pip
 curl -fsSL https://raw.githubusercontent.com/maomaocun/cpa-stats/master/install.sh | sh
+#   proxy for the GitHub downloads: CPA_STATS_PROXY / https_proxy env,
+#   or a local 127.0.0.1:7890 proxy is auto-detected
 
 # or from a checkout / a tag
 pipx install .          # or: pip install --user .
