@@ -276,6 +276,121 @@ class TestParseCredentials:
         assert len(parse_credentials([cred_fixture()])) == 1
 
 
+def codex_fixture(**kw):
+    base = {
+        "id": "codex-a.json", "name": "codex-a.json", "provider": "codex",
+        "label": "c@example.com", "status": "active", "email": "c@example.com",
+        "quota": {"observed_at": "2026-11-06T14:23:38+08:00",
+                  "signals": {
+                      "X-Codex-Plan-Type": "pro",
+                      "X-Codex-Primary-Used-Percent": "42",
+                      "X-Codex-Primary-Window-Minutes": "300",
+                      "X-Codex-Primary-Reset-After-Seconds": "3600",
+                      "X-Codex-Secondary-Used-Percent": "63",
+                      "X-Codex-Secondary-Window-Minutes": "10080",
+                      "X-Codex-Secondary-Reset-At": "1762531200",
+                      "X-Codex-Credits-Has-Credits": "true",
+                      "X-Codex-Credits-Balance": "12.5",
+                      "X-Codex-Allowed": "true",
+                      "X-Codex-Limit-Reached": "false",
+                      "X-Codex-Additional-GPT-Spark-Primary-Used-Percent": "3",
+                      "X-Codex-Additional-GPT-Spark-Limit-Name": "GPT-5.3-Spark",
+                      "X-Codex-Code-Review-Primary-Used-Percent": "17",
+                      "Retry-After": "120",
+                  }},
+    }
+    base.update(kw)
+    return base
+
+
+def claude_fixture(**kw):
+    base = {
+        "id": "claude-a.json", "name": "claude-a.json", "provider": "claude",
+        "label": "cl@example.com", "status": "active", "email": "cl@example.com",
+        "quota": {"observed_at": "2026-11-06T14:23:38+08:00",
+                  "signals": {
+                      "Anthropic-Ratelimit-Unified-Status": "allowed",
+                      "Anthropic-Ratelimit-Unified-5h-Utilization": "0.42",
+                      "Anthropic-Ratelimit-Unified-5h-Reset": "1762531200",
+                      "Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+                      "Anthropic-Ratelimit-Unified-7d-Utilization": "0.63",
+                      "Anthropic-Ratelimit-Unified-7d-Reset": "1763136000",
+                  }},
+    }
+    base.update(kw)
+    return base
+
+
+class TestCodexCredentials:
+    def test_normalized_windows(self):
+        (c,) = parse_credentials({"files": [codex_fixture()]})
+        assert c.provider == "codex"
+        assert c.plan == "pro"
+        assert c.daily_pct == 58          # 100 - 42 used
+        assert c.weekly_pct == 37         # 100 - 63 used
+        assert c.daily_label == "5h"      # 300 minutes
+        assert c.weekly_label == "7d"     # 10080 minutes
+        assert c.weekly_reset == 1762531200
+        assert not c.limited
+        assert c.retry_after_ts is not None
+        # consumed keys don't show up in extra
+        assert not any(k.startswith("x-codex-") or k == "retry-after"
+                       for k in (c.extra or {}))
+
+    def test_named_limits(self):
+        (c,) = parse_credentials({"files": [codex_fixture()]})
+        labels = {lim["label"] for lim in c.limits}
+        assert "GPT-5.3-Spark" in labels           # limit-name wins over slug
+        assert "code review" in labels
+        spark = next(l for l in c.limits if l["label"] == "GPT-5.3-Spark")
+        assert spark["short"]["pct"] == 97          # 100 - 3 used
+
+    def test_limit_reached(self):
+        (c,) = parse_credentials({"files": [codex_fixture(
+            quota={"signals": {"X-Codex-Limit-Reached": "true",
+                               "X-Codex-Primary-Used-Percent": "100"}})]})
+        assert c.limited
+        assert c.daily_pct == 0
+
+    def test_credits(self):
+        (c,) = parse_credentials({"files": [codex_fixture()]})
+        assert c.credits == {"has-credits": "true", "balance": "12.5"}
+
+
+class TestClaudeCredentials:
+    def test_normalized_windows(self):
+        (c,) = parse_credentials({"files": [claude_fixture()]})
+        assert c.provider == "claude"
+        assert c.daily_pct == 58           # (1 - 0.42) * 100
+        assert c.weekly_pct == 37          # (1 - 0.63) * 100
+        assert c.daily_label == "5h" and c.weekly_label == "7d"
+        assert c.daily_reset == 1762531200
+        assert c.weekly_reset == 1763136000
+        assert not c.limited
+        # consumed headers don't leak into extra
+        assert not any("ratelimit" in k for k in (c.extra or {}))
+
+    def test_rejected_is_limited(self):
+        (c,) = parse_credentials({"files": [claude_fixture(
+            quota={"signals": {
+                "Anthropic-Ratelimit-Unified-5h-Status": "rejected",
+                "Anthropic-Ratelimit-Unified-Status": "rejected",
+                "Anthropic-Ratelimit-Unified-5h-Utilization": "1.0"}})]})
+        assert c.limited
+        assert c.daily_pct == 0
+
+
+class TestCredSort:
+    def test_worst_first(self):
+        good = parse_credentials({"files": [cred_fixture()]})[0]
+        bad = parse_credentials({"files": [cred_fixture(
+            id="b", name="b", unavailable=True)]})[0]
+        lim = parse_credentials({"files": [codex_fixture(
+            quota={"signals": {"X-Codex-Limit-Reached": "true"}})]})[0]
+        from cpa_stats.model import cred_sort_key
+        assert sorted([good, bad, lim], key=cred_sort_key)[0] is bad
+
+
 class TestDetailPairs:
     def test_covers_v3_fields(self):
         r = row(request_id="req-1", endpoint="POST /v1/responses",
@@ -352,6 +467,16 @@ class TestQuotaForecast:
         fc = quota_forecast(rows, "weekly_pct")
         _, per_day, eta = fc
         assert abs(per_day - 120) < 0.5  # 5% per hour
+
+    def test_watermark_correction_cut(self):
+        # A stale observation corrected 81% -> 73% in one poll must not poison
+        # the slope: only the post-correction run (73 -> 71 over 1h) is fitted.
+        rows = hist([(2.0, 81), (1.98, 73), (1.0, 72), (0.0, 71)])
+        fc = quota_forecast(rows, "weekly_pct")
+        assert fc is not None
+        cur, per_day, eta = fc
+        assert cur == 71
+        assert per_day < 60        # ~2%/h, not the bogus ~500%/d jump fit
 
     def test_flat_or_insufficient(self):
         assert quota_forecast(hist([(1, 50), (0, 50)]), "weekly_pct") is None

@@ -35,10 +35,13 @@ cpa-stats tail                            # one line per request, live (-v: full
 cpa-stats show <id>                       # every captured field of one request (--raw for JSON)
 cpa-stats quota                           # credential quota / cooldowns + burn forecast
 cpa-stats errors                          # failure breakdown by model / status / code / endpoint
+cpa-stats top --since 7d                  # heaviest requests (by tokens / output / cost / latency)
 cpa-stats summary --since 7d --by model   # aggregate report
 cpa-stats export --since 7d -o out.csv    # CSV / JSONL export
 cpa-stats prune --older-than 30d          # drop old records
 ```
+
+View commands accept `-m` (model), `-s` (session) and `-a` (account) filters.
 
 ### `cpa-stats tui`
 
@@ -46,11 +49,11 @@ Interactive dashboard (textual). Same data as `watch`, but navigable:
 
 | key / mouse | action |
 |-|-|
-| `1` `2` `3` `4` | switch window: 15 m / 1 h / 6 h / 24 h |
+| `1`–`7` | switch window: 15 m / 1 h / 6 h / 24 h / 7 d / 30 d / all |
 | `↑` `↓` / wheel / click | select a row in the focused table |
 | `←` `→` | cycle right-hand tabs (recent · sessions · quota · totals) |
 | `tab` | cycle focus between panels |
-| `enter` | request/credential detail modal; on a session row: filter to it (again to clear) |
+| `enter` | request/credential detail modal; on a session or model row: filter to it (again to clear) |
 | `f` | toggle the model filter input |
 | `p` | pause / resume auto-refresh |
 | `r` | force refresh |
@@ -105,11 +108,17 @@ The collector also snapshots `GET /v8/management/credentials` (fallback
 disables). The latest payload lives in `meta.credentials_snapshot` and each
 poll also appends to the `quota_history` table — every viewer reads the db
 locally, no extra management calls. `cpa-stats quota`, the `watch` dashboard,
-and the TUI **quota** tab show per-credential: plan, daily/weekly quota
-remaining %, reset countdowns, ok/fail request counts, status
-(`active` / `error` / `blocked`), cooldowns, per-model quotas, and any other
-provider signals (e.g. `x-codex-*`, `anthropic-ratelimit-*` for Codex/Claude
-credentials). From the history, `quota` computes a burn forecast
+and the TUI **quota** tab show per-credential: plan, quota remaining % per
+window, reset countdowns, ok/fail request counts, status
+(`active` / `error` / `blocked` / `limited`), cooldowns, per-model quotas, and
+leftover provider signals. Devin reads `daily_quota_*`/`weekly_quota_*`; Codex
+`x-codex-primary-*`/`secondary-*` (with the true window length from
+`window-minutes`, credits and named additional limits like code-review and
+`additional-<name>-*`); Claude `anthropic-ratelimit-unified-5h-*`/`7d-*`
+(utilization → remaining %, per-window status). `x-codex-limit-reached`,
+`x-codex-allowed` and `*-status: rejected` mark a credential **limited**;
+`Retry-After` is shown as a retry countdown. From the history, `quota`
+computes a burn forecast
 (`−N%/day → 0 in Xd`) and a trend sparkline — so an account heading for
 exhaustion is visible before it is blocked. `watch` also shows a red ⚠ line
 when a credential is blocked or the window failure rate exceeds 5%.

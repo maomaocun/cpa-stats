@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cpa-stats"
-version = "2.1.0"
+version = "2.2.0"
 description = "Per-request latency / TTFT / TPS / cost monitoring for CLIProxyAPI"
 readme = "README.md"
 requires-python = ">=3.10"

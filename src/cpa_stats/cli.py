@@ -41,7 +41,9 @@ DEFAULT_DB = (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")
 
 def cmd_export(args) -> None:
     conn = open_db_ro(args.db)
-    rows = list(reversed(load_rows(conn, time.time() - args.since, args.model, args.session)))
+    rows = list(reversed(load_rows(conn, time.time() - args.since,
+                                   args.model, args.session,
+                                   account=getattr(args, "account", None))))
     out = open(args.output, "w", newline="") if args.output else sys.stdout
     fields = [c for c in COLUMNS if c != "raw"] + [
         "prompt_tokens_total", "uncached_tokens", "cache_hit_ratio",
@@ -115,6 +117,17 @@ def cmd_doctor(args) -> None:
             raise urllib.error.HTTPError(cfg.url, last_code or 404,
                                        "management config not found", {}, None)
         line(True, "management API reachable, key accepted")
+        try:
+            req = urllib.request.Request(
+                f"{cfg.url}/v8/management/server/latest-version",
+                headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
+            with opener.open(req, timeout=5) as resp:
+                ver = json.loads(resp.read() or b"{}")
+            latest = ver.get("latest-version") or ver.get("latest_version")
+            if latest:
+                line(True, f"latest upstream release {latest}")
+        except Exception:  # noqa: BLE001 — informational only
+            pass
         flat = json.dumps(body)
         m = re.search(r'"usage-statistics-enabled":\s*(true|false)', flat)
         if m:
@@ -219,6 +232,7 @@ def main(argv=None) -> None:
     filters = argparse.ArgumentParser(add_help=False)
     filters.add_argument("-m", "--model", help="filter: substring of model / alias")
     filters.add_argument("-s", "--session", help="filter: session id prefix")
+    filters.add_argument("-a", "--account", help="filter: substring of account / auth index")
 
     p = argparse.ArgumentParser(prog="cpa-stats", description=DOC,
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -227,7 +241,7 @@ def main(argv=None) -> None:
     sub = p.add_subparsers(dest="cmd")
 
     from .views import (cmd_errors, cmd_quota, cmd_show, cmd_summary,
-                        cmd_tail, cmd_watch)
+                        cmd_tail, cmd_top, cmd_watch)
 
     w = sub.add_parser("watch", parents=[common, filters], help="live dashboard (default)")
     w.add_argument("-w", "--window", type=parse_duration, default=parse_duration("1h"),
@@ -276,6 +290,16 @@ def main(argv=None) -> None:
     er.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
                     help="window (default 24h)")
     er.set_defaults(func=cmd_errors)
+
+    tp = sub.add_parser("top", parents=[common, filters],
+                        help="heaviest requests by tokens / output / cost / latency")
+    tp.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
+                    help="window (default 24h)")
+    tp.add_argument("--by", choices=["tokens", "output", "cost", "latency"],
+                    default="tokens")
+    tp.add_argument("-n", "--limit", type=int, default=15)
+    add_price_arg(tp)
+    tp.set_defaults(func=cmd_top)
 
     sh = sub.add_parser("show", parents=[common],
                         help="full detail for one request (id / request_id / trace_id prefix)")

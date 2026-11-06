@@ -384,3 +384,46 @@ class TestErrorsCmd:
         conn.close()
         main(["errors", "--db", str(db), "--since", "1d"])
         assert "no failures" in capsys.readouterr().out
+
+
+class TestTopCmd:
+    def test_top_by_tokens(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("COLUMNS", "160")
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        recs = [make_rec(1),
+                dict(make_rec(2), source="acct-b",
+                     tokens={"input_tokens": 50000, "output_tokens": 900}),
+                dict(make_rec(3), source="acct-a",
+                     tokens={"input_tokens": 999999, "output_tokens": 100})]
+        insert_records(conn, recs)
+        conn.close()
+        main(["top", "--db", str(db), "--since", "1d"])
+        out = capsys.readouterr().out
+        assert "top" in out and "acct-a" in out
+        # heaviest row (999k in) sorts first
+        assert out.index("acct-a") < out.index("acct-b")
+
+    def test_account_filter(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("COLUMNS", "160")
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [dict(make_rec(1), source="acct-a"),
+                              dict(make_rec(2), source="acct-b")])
+        conn.close()
+        main(["summary", "--db", str(db), "--since", "1d", "-a", "acct-a"])
+        out = capsys.readouterr().out
+        # by-account table should list only acct-a, not acct-b
+        main(["summary", "--db", str(db), "--since", "1d", "--by", "account",
+              "-a", "acct-a"])
+        out = capsys.readouterr().out
+        assert "acct-a" in out and "acct-b" not in out
+
+    def test_top_empty(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        conn.close()
+        main(["top", "--db", str(db), "--since", "1d"])
+        assert "no requests" in capsys.readouterr().out

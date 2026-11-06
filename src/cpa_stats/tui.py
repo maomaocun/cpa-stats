@@ -7,11 +7,12 @@ Layout
     footer   keybindings
 
 Keys
-    1/2/3/4   window 15m / 1h / 6h / 24h
+    1-7     window 15m / 1h / 6h / 24h / 7d / 30d / all
     up/down   select a row (mouse wheel scrolls; click selects)
     left/right switch right-hand tabs (recent / sessions / quota / totals)
     tab       cycle focus between panels
     enter     detail modal (request or credential)
+    enter on models row    filter everything to that model (again to clear)
     f         filter (model substring)
     enter on sessions row  filter everything to that session (again to clear)
     p         pause / resume refresh
@@ -28,10 +29,10 @@ from pathlib import Path
 from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
-                    decode_tps, e2e_tps, field, group_by, parse_credentials,
-                    parse_iso_ts, quota_forecast, quota_pct_series,
-                    request_detail_pairs, short_endpoint, short_model,
-                    token_parts)
+                    cred_sort_key, decode_tps, e2e_tps, field, group_by,
+                    parse_credentials, parse_iso_ts, quota_forecast,
+                    quota_pct_series, request_detail_pairs, short_endpoint,
+                    short_model, token_parts)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -40,6 +41,9 @@ WINDOWS = {  # key -> seconds
     "2": ("1h", 60 * 60),
     "3": ("6h", 6 * 3600),
     "4": ("24h", 24 * 3600),
+    "5": ("7d", 7 * 86400),
+    "6": ("30d", 30 * 86400),
+    "7": ("all", None),
 }
 
 
@@ -88,11 +92,14 @@ def build_app():
             c = self.cred
             lines = []
             state = c.status + (" · blocked" if c.blocked else "")
+            if c.limited:
+                state += " · limited"
             lines.append(f"[dim]{'status':>16}[/]  {escape(state)}")
             if c.status_message:
                 lines.append(f"[dim]{'message':>16}[/]  [red]{escape(c.status_message)}[/]")
             lines.append(f"[dim]{'requests':>16}[/]  {c.ok} ok · {c.fail} failed")
-            for key, tag in (("daily_pct", "daily"), ("weekly_pct", "weekly")):
+            for key, tag in (("daily_pct", c.daily_label or "daily"),
+                             ("weekly_pct", c.weekly_label or "weekly")):
                 series = quota_pct_series(self.history, key)
                 if len(series) >= 2:
                     fc = quota_forecast(self.history, key)
@@ -102,6 +109,30 @@ def build_app():
                     lines.append(
                         f"[dim]{tag:>16}[/]  [cyan]{sparkline(series[-40:])}[/]"
                         f"  {series[-1]}%{escape(eta)}")
+            if c.retry_after_ts:
+                lines.append(f"[dim]{'retry-after':>16}[/]  "
+                             f"{escape(_fmt_reset(c.retry_after_ts))}")
+            for lim in c.limits or []:
+                bits = []
+                for tag in ("short", "long"):
+                    w = lim.get(tag)
+                    if not w:
+                        continue
+                    s = (f"{tag} {w['pct']}%" if w.get("pct") is not None
+                         else f"{tag} —")
+                    if w.get("window"):
+                        s += f"/{w['window']}"
+                    if w.get("reset"):
+                        s += f" resets {_fmt_reset(w['reset'])}"
+                    bits.append(s)
+                if lim.get("limited"):
+                    bits.append("LIMITED")
+                lines.append(f"[dim]{'limit':>16}[/]  "
+                             f"{escape(str(lim['label']))}: {escape(' · '.join(bits))}")
+            if c.credits:
+                rendered = " ".join(f"{escape(str(k))}={escape(str(v))}"
+                                    for k, v in sorted(c.credits.items()))
+                lines.append(f"[dim]{'credits':>16}[/]  {rendered}")
             for k in sorted(c.signals or {}):
                 lines.append(f"[dim]{'signal':>16}[/]  {escape(str(k))} = {escape(str(c.signals[k]))}")
             for cd in c.cooldowns or []:
@@ -159,6 +190,9 @@ def build_app():
             Binding("2", "win('2')", "1h"),
             Binding("3", "win('3')", "6h"),
             Binding("4", "win('4')", "24h"),
+            Binding("5", "win('5')", "7d"),
+            Binding("6", "win('6')", "30d"),
+            Binding("7", "win('7')", "all"),
             Binding("f", "toggle_filter", "filter"),
             Binding("p", "toggle_pause", "pause"),
             Binding("r", "refresh_data", "refresh"),
@@ -230,6 +264,7 @@ def build_app():
         # ------------------------------------------------------------ data
 
         def _window_s(self):
+            """Window in seconds; None means 'all stored rows'."""
             return WINDOWS[self.window_key][1]
 
         def _tick(self):
@@ -239,7 +274,8 @@ def build_app():
         def refresh_data(self):
             if not self.conn:
                 return
-            since = time.time() - self._window_s()
+            win = self._window_s()
+            since = time.time() - win if win else 0
             self.rows = load_rows(self.conn, since, self.model_filter or None,
                                   self.session_filter or None)
             self.creds = parse_credentials(load_quota_snapshot(self.conn))
@@ -285,7 +321,11 @@ def build_app():
 
         def _render_all(self):
             rows = self.rows
-            agg = aggregate(rows, self._window_s(), self.pricing)
+            win = self._window_s()
+            # "all" spans the oldest stored row, not a fixed duration.
+            span = win or (time.time() - min((r["ts"] for r in rows),
+                                             default=time.time())) or 60
+            agg = aggregate(rows, win, self.pricing)
             totals = db_totals(self.conn, self.pricing)
 
             # --- statusbar
@@ -334,10 +374,9 @@ def build_app():
                 self._set_card(card_widgets, i, t, v, s)
 
             # --- activity sparkline
-            counts = bucket_counts(rows, time.time() - self._window_s(),
-                                   self._window_s() / 40, 40)
+            counts = bucket_counts(rows, time.time() - span, span / 40, 40)
             tok_h = (sum(token_parts(r)[0] + (r["output_tokens"] or 0)
-                         for r in rows) / (self._window_s() / 3600))
+                         for r in rows) / (span / 3600))
             act = self.query_one("#activity", Static)
             act.update(
                 f"activity {sparkline(counts)}  "
@@ -350,7 +389,7 @@ def build_app():
             mt.clear()
             for name, grp in sorted(group_by(rows, short_model).items(),
                                     key=lambda kv: -len(kv[1])):
-                a = aggregate(grp, self._window_s())
+                a = aggregate(grp, win)
                 mt.add_row(name, str(a.n), str(a.failed),
                            fmt_ms(a.ttft_p50), fmt_tps(a.tps_p50),
                            fmt_tps(a.e2e_p50), fmt_tok(a.in_tok),
@@ -398,8 +437,9 @@ def build_app():
             # --- quota / credentials
             qt = self.query_one("#quota-table", DataTable)
             qt.clear()
-            for c in self.creds:
-                state = c.status + (" · blocked" if c.blocked else "")
+            for c in sorted(self.creds, key=cred_sort_key):
+                state = c.status + (" · blocked" if c.blocked else "") \
+                    + (" · limited" if c.limited else "")
                 resets = f"{_fmt_reset(c.daily_reset)}/{_fmt_reset(c.weekly_reset)}"
                 extra = " ".join(f"{k}={v}" for k, v in
                                  list((c.extra or {}).items())[:8])
@@ -408,8 +448,12 @@ def build_app():
                 qt.add_row(
                     c.account + (f" · {c.provider}" if c.provider else ""), state,
                     f"{c.ok}/{c.fail}", c.plan or "—",
-                    f"{c.daily_pct}%" if c.daily_pct is not None else "—",
-                    f"{c.weekly_pct}%" if c.weekly_pct is not None else "—",
+                    (f"{c.daily_pct}% {c.daily_label}"
+                     if c.daily_label not in ("daily", "") else f"{c.daily_pct}%")
+                    if c.daily_pct is not None else "—",
+                    (f"{c.weekly_pct}% {c.weekly_label}"
+                     if c.weekly_label not in ("weekly", "") else f"{c.weekly_pct}%")
+                    if c.weekly_pct is not None else "—",
                     (fmt_age(time.time() - obs).replace(" ago", "")
                      if obs else "—"),
                     resets if resets != "—/—" else "—", eta or "—",
@@ -492,7 +536,8 @@ def build_app():
             if self.focused is not None and getattr(self.focused, "id", "") == "quota-table":
                 cred = self._selected_cred()
                 if cred:
-                    self.push_screen(CredScreen(cred))
+                    self.push_screen(CredScreen(
+                        cred, self.creds_hist.get(cred.name)))
                 return
             row = self._selected_row()
             if row:
@@ -513,6 +558,22 @@ def build_app():
                     self.session_filter = ("" if self.session_filter == sid
                                            else sid)
                     self.refresh_data()
+            elif event.data_table.id == "models":
+                mdl = self._selected_model()
+                if mdl:
+                    self.model_filter = ("" if self.model_filter == mdl
+                                         else mdl)
+                    self.refresh_data()
+
+        def _selected_model(self):
+            mt = self.query_one("#models", DataTable)
+            if mt.cursor_row is None or mt.cursor_row >= len(mt.rows):
+                return None
+            try:
+                return mt.coordinate_to_cell_key(
+                    mt.cursor_coordinate).row_key.value
+            except Exception:
+                return None
 
         def _selected_session(self):
             st = self.query_one("#sessions-table", DataTable)
@@ -553,16 +614,22 @@ def _quota_chip(creds) -> str:
         return ""
     daily = min((c.daily_pct for c in vals if c.daily_pct is not None), default=None)
     weekly = min((c.weekly_pct for c in vals if c.weekly_pct is not None), default=None)
+    dl = next(({"daily": "d"}.get(c.daily_label, c.daily_label) for c in vals
+               if c.daily_pct is not None and c.daily_pct == daily), "d")
+    wl = next(({"weekly": "w"}.get(c.weekly_label, c.weekly_label) for c in vals
+               if c.weekly_pct is not None and c.weekly_pct == weekly), "w")
     txt = "   quota"
     if daily is not None:
-        txt += f" d{daily}%"
+        txt += f" {dl}{daily}%"
     if weekly is not None:
-        txt += f" w{weekly}%"
+        txt += f" {wl}{weekly}%"
     low = min(p for p in (daily, weekly) if p is not None)
     style = "green" if low >= 50 else ("yellow" if low >= 20 else "red")
     chip = f"[{style}]{txt}[/]"
     if any(c.blocked for c in creds):
         chip += " [red]blocked[/]"
+    elif any(c.limited for c in creds):
+        chip += " [red]limited[/]"
     return chip
 
 

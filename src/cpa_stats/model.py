@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 # Below these thresholds the decode window is too short to give a meaningful TPS.
 MIN_DECODE_MS = 300
@@ -328,9 +329,9 @@ def bucket_counts(rows, since_ts: float, bucket_s: float, buckets: int) -> list[
 
 # --------------------------------------------------------------------------- quota
 
-# Signal keys CPA writes for Devin credentials (from GetUserStatus); anything
-# else in `signals` (x-codex-*, anthropic-ratelimit-*, plugin values) is shown
-# verbatim as "extra".
+# Signal keys CPA writes for Devin credentials (from GetUserStatus). Codex
+# (x-codex-*) and Claude (anthropic-ratelimit-*) snapshots are normalized into
+# the same daily/weekly fields below; anything left over lands in `extra`.
 DEVIN_QUOTA_KEYS = {
     "plan", "daily_quota_remaining_percent", "weekly_quota_remaining_percent",
     "daily_quota_reset_at", "weekly_quota_reset_at", "plan_start", "plan_end",
@@ -355,6 +356,250 @@ def parse_iso_ts(value) -> float | None:
         return None
 
 
+def _parse_float(value) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_epoch(value) -> float | None:
+    """Unix seconds / milliseconds or RFC3339 -> epoch seconds."""
+    if value is None:
+        return None
+    f = _parse_float(value)
+    if f is not None and f > 0:
+        if f > 1e12:            # milliseconds
+            f /= 1000.0
+        return f
+    return parse_iso_ts(value)
+
+
+def _retry_after_ts(value, base: float) -> float | None:
+    """Retry-After header (seconds or HTTP-date) -> absolute epoch."""
+    if value is None:
+        return None
+    secs = _parse_float(value)
+    if secs is not None:
+        return base + max(0.0, secs)
+    try:
+        return parsedate_to_datetime(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _window_minutes_label(minutes) -> str:
+    """300 -> '5h', 10080 -> '7d', 45 -> '45m'; '' when unknown."""
+    m = _parse_float(minutes)
+    if not m or m <= 0:
+        return ""
+    if m % 1440 == 0:
+        return f"{int(m // 1440)}d"
+    if m % 60 == 0:
+        return f"{int(m // 60)}h"
+    return f"{int(m)}m"
+
+
+def _remaining_from_used(used) -> int | None:
+    """used-percent signal ('42' / '42%') -> remaining pct."""
+    u = _parse_float(used)
+    if u is None:
+        return None
+    return max(0, min(100, round(100 - u)))
+
+
+def _remaining_from_util(util) -> int | None:
+    """Claude utilization fraction (0.42) -> remaining pct; >1 is already %."""
+    u = _parse_float(util)
+    if u is None:
+        return None
+    rem = (1 - u) * 100 if u <= 1.0 else 100 - u
+    return max(0, min(100, round(rem)))
+
+
+def _truthy(value) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _falsy(value) -> bool:
+    return str(value).strip().lower() in ("false", "0", "no")
+
+
+# Named Codex windows: x-codex-additional-<slug>-*, x-codex-code-review-* and
+# short-name namespaces like x-codex-bengalfox-primary-used-percent.
+_CODEX_WIN_SUFFIXES = ("used-percent", "window-minutes", "reset-after-seconds",
+                       "reset-at", "over-secondary-limit-percent")
+_CODEX_WIN_RE = re.compile(
+    r"^(?:(?P<slug>.+)-)?(?P<win>primary|secondary)-(?P<fld>"
+    + "|".join(_CODEX_WIN_SUFFIXES) + r")$")
+_CODEX_FLAG_RE = re.compile(
+    r"^(?:(?P<slug>.+)-)?(?P<fld>allowed|limit-reached|limit-name|status)$")
+_CLAUDE_STATUS_KEYS = ("anthropic-ratelimit-unified-status",
+                       "anthropic-ratelimit-unified-5h-status",
+                       "anthropic-ratelimit-unified-7d-status")
+
+
+def _codex_window_reset(sig: dict, prefix: str, used: set, base: float):
+    """reset-at epoch, else observed + reset-after-seconds."""
+    key = f"{prefix}reset-at"
+    if key in sig:
+        used.add(key)
+        t = _parse_epoch(sig[key])
+        if t:
+            return t
+    key = f"{prefix}reset-after-seconds"
+    if key in sig:
+        used.add(key)
+        secs = _parse_float(sig[key])
+        if secs is not None:
+            return base + secs
+    return None
+
+
+def _normalize_codex(c: "CredInfo", sig: dict, used: set, base: float) -> None:
+    """Map x-codex-* signals onto the shared daily/weekly quota fields.
+
+    Codex reports *used* percent per window: primary is the short window
+    (typically 5h, x-codex-primary-window-minutes says exactly), secondary the
+    long one (typically 7d)."""
+    if sig.get("x-codex-plan-type"):
+        used.add("x-codex-plan-type")
+        c.plan = c.plan or str(sig["x-codex-plan-type"])
+    for win, pct_attr, reset_attr, label_attr, dflt in (
+            ("primary", "daily_pct", "daily_reset", "daily_label", "5h"),
+            ("secondary", "weekly_pct", "weekly_reset", "weekly_label", "7d")):
+        ukey = f"x-codex-{win}-used-percent"
+        if ukey in sig:
+            used.add(ukey)
+            rem = _remaining_from_used(sig[ukey])
+            if rem is not None:
+                setattr(c, pct_attr, rem)
+        rt = _codex_window_reset(sig, f"x-codex-{win}-", used, base)
+        if rt:
+            setattr(c, reset_attr, rt)
+        mkey = f"x-codex-{win}-window-minutes"
+        label = ""
+        if mkey in sig:
+            used.add(mkey)
+            label = _window_minutes_label(sig[mkey])
+        setattr(c, label_attr, label or dflt)
+    for key in ("x-codex-active-limit", "x-codex-allowed",
+                "x-codex-limit-reached"):
+        if key in sig:
+            used.add(key)
+    if _truthy(sig.get("x-codex-limit-reached")) or _falsy(sig.get("x-codex-allowed")):
+        c.limited = True
+    credits = {}
+    for k, v in sig.items():
+        if k.startswith("x-codex-credits-"):
+            used.add(k)
+            credits[k[len("x-codex-credits-"):]] = v
+    c.credits = credits or None
+    # Named extra windows (additional limits, code review, short-name slugs).
+    groups: dict[str, dict] = {}
+    for k, v in sig.items():
+        if not k.startswith("x-codex-") or k in used:
+            continue
+        body = k[len("x-codex-"):]
+        ns, rest = "", body
+        if body.startswith("additional-"):
+            ns, rest = "additional", body[len("additional-"):]
+        elif body.startswith("code-review-"):
+            ns, rest = "code review", body[len("code-review-"):]
+        elif body.startswith(("primary-", "secondary-")):
+            continue                # main window handled above
+        m = _CODEX_WIN_RE.match(rest)
+        if m:
+            name = m.group("slug") or ns
+            if not name:
+                continue
+            ent = groups.setdefault(name, {"name": name, "windows": {}})
+            ent["windows"].setdefault(m.group("win"), {})[m.group("fld")] = v
+            used.add(k)
+            continue
+        m = _CODEX_FLAG_RE.match(rest)
+        if m:
+            name = m.group("slug") or ns
+            if not name:
+                continue            # bare 'allowed' etc. = main-window scalar
+            ent = groups.setdefault(name, {"name": name, "windows": {}})
+            ent[m.group("fld")] = v
+            used.add(k)
+    c.limits = []
+    for name, ent in sorted(groups.items()):
+        item = {"name": name, "label": ent.get("limit-name") or name}
+        if _truthy(ent.get("limit-reached")) or _falsy(ent.get("allowed")):
+            item["limited"] = True
+        for win, tag in (("primary", "short"), ("secondary", "long")):
+            w = ent["windows"].get(win)
+            if not w:
+                continue
+            rt = _parse_epoch(w.get("reset-at"))
+            if rt is None:
+                secs = _parse_float(w.get("reset-after-seconds"))
+                rt = base + secs if secs is not None else None
+            item[tag] = {
+                "pct": _remaining_from_used(w.get("used-percent")),
+                "window": _window_minutes_label(w.get("window-minutes")),
+                "reset": rt,
+            }
+            over = _parse_float(w.get("over-secondary-limit-percent"))
+            if over is not None:
+                item[tag]["over_pct"] = over
+        c.limits.append(item)
+
+
+def _normalize_claude(c: "CredInfo", sig: dict, used: set, base: float) -> None:
+    """Map anthropic-ratelimit-unified-* signals onto daily/weekly fields.
+
+    Utilization is a 0..1 *used* fraction; remaining = (1 - u) * 100."""
+    c.daily_label, c.weekly_label = "5h", "7d"
+    for win, pct_attr, reset_attr in (
+            ("5h", "daily_pct", "daily_reset"),
+            ("7d", "weekly_pct", "weekly_reset")):
+        ukey = f"anthropic-ratelimit-unified-{win}-utilization"
+        if ukey in sig:
+            used.add(ukey)
+            rem = _remaining_from_util(sig[ukey])
+            if rem is not None:
+                setattr(c, pct_attr, rem)
+        for suffix in (f"-{win}-reset", f"-{win}-status"):
+            key = f"anthropic-ratelimit-unified{suffix}"
+            if key in sig:
+                used.add(key)
+        rkey = f"anthropic-ratelimit-unified-{win}-reset"
+        t = _parse_epoch(sig.get(rkey))
+        if t:
+            setattr(c, reset_attr, t)
+    if "anthropic-ratelimit-unified-reset" in sig:
+        used.add("anthropic-ratelimit-unified-reset")
+        t = _parse_epoch(sig["anthropic-ratelimit-unified-reset"])
+        if t and c.daily_reset is None:
+            c.daily_reset = t
+    if "anthropic-ratelimit-unified-status" in sig:
+        used.add("anthropic-ratelimit-unified-status")
+    statuses = {str(sig.get(k) or "").strip().lower()
+                for k in _CLAUDE_STATUS_KEYS}
+    if "rejected" in statuses:
+        c.limited = True
+
+
+def _normalize_signals(c: "CredInfo", observed: float | None) -> set:
+    """Dispatch to the provider's signal mapper; returns consumed key set."""
+    used: set = set()
+    sig = {str(k).lower(): v for k, v in (c.signals or {}).items()}
+    base = observed or time.time()
+    provider = c.provider.lower()
+    if provider == "codex":
+        _normalize_codex(c, sig, used, base)
+    elif provider == "claude":
+        _normalize_claude(c, sig, used, base)
+    if "retry-after" in sig:
+        used.add("retry-after")
+        c.retry_after_ts = _retry_after_ts(sig["retry-after"], base)
+    return used
+
+
 @dataclass
 class CredInfo:
     """One managed credential from a /credentials snapshot."""
@@ -371,13 +616,19 @@ class CredInfo:
     plan: str = ""
     daily_pct: int | None = None
     weekly_pct: int | None = None
+    daily_label: str = "daily"      # window name: 'daily', '5h', ...
+    weekly_label: str = "weekly"
     daily_reset: float | None = None
     weekly_reset: float | None = None
     plan_start: float | None = None
     plan_end: float | None = None
+    limited: bool = False           # upstream signals limit reached / rejected
+    retry_after_ts: float | None = None
+    credits: dict | None = None     # codex credits-*
+    limits: list | None = None      # named extra windows (codex additional/*)
     observed_at: str = ""
     signals: dict | None = None
-    extra: dict | None = None       # non-Devin signals, e.g. x-codex-*/anthropic-*
+    extra: dict | None = None       # signals not normalized above
     cooldowns: list | None = None
     model_quotas: dict | None = None
 
@@ -401,7 +652,7 @@ def parse_credentials(snap) -> list[CredInfo]:
             status = "disabled"
         account = (f.get("email") or f.get("account") or f.get("label")
                    or f.get("name") or f.get("id") or "?")
-        out.append(CredInfo(
+        c = CredInfo(
             name=str(f.get("name") or f.get("id") or "?"),
             provider=str(f.get("provider") or f.get("type") or ""),
             account=str(account),
@@ -420,14 +671,28 @@ def parse_credentials(snap) -> list[CredInfo]:
             plan_end=parse_iso_ts(signals.get("plan_end")),
             observed_at=str(quota.get("observed_at") or ""),
             signals=signals,
-            extra={k: v for k, v in signals.items() if k not in DEVIN_QUOTA_KEYS},
             cooldowns=list(f.get("cooldowns") or []),
             model_quotas=f.get("model_quotas") if isinstance(f.get("model_quotas"), dict) else {},
-        ))
+        )
+        used = _normalize_signals(c, parse_iso_ts(c.observed_at))
+        c.extra = {str(k).lower(): v for k, v in signals.items()
+                   if str(k).lower() not in DEVIN_QUOTA_KEYS
+                   and str(k).lower() not in used}
+        out.append(c)
     return out
 
 
-def quota_forecast(history_rows, key: str = "weekly_pct", min_span_s: float = 1800):
+def cred_sort_key(c: CredInfo):
+    """Worst-first ordering for quota tables: blocked, then limited, then the
+    lowest weekly/daily percentage."""
+    return (not c.blocked, not c.limited,
+            c.weekly_pct is None, c.weekly_pct if c.weekly_pct is not None else 0,
+            c.daily_pct is None, c.daily_pct if c.daily_pct is not None else 0,
+            c.account)
+
+
+def quota_forecast(history_rows, key: str = "weekly_pct",
+                   min_span_s: float = 1800, max_step_rate: float = 0.1):
     """Burn-rate forecast for one credential's history rows (ts ascending).
 
     Returns (current_pct, pct_drop_per_day, eta_ts) or None when the quota
@@ -436,6 +701,11 @@ def quota_forecast(history_rows, key: str = "weekly_pct", min_span_s: float = 18
     The slope is least-squares over that run and requires `min_span_s` of
     coverage (30 min default) — quota is consumed in bursts, so a slope from
     a couple of minutes is meaningless noise.
+
+    A single-step drop faster than max_step_rate pct/s (default 0.1 ≈ 6%/min)
+    is treated as a watermark correction — a stale observation replaced by a
+    fresh one — rather than consumption, and cuts the run there. Real burn
+    almost never moves a multi-hour window that fast.
     """
     pts = sorted(
         (r["ts"], r[key]) for r in history_rows
@@ -445,7 +715,13 @@ def quota_forecast(history_rows, key: str = "weekly_pct", min_span_s: float = 18
         return None
     end = len(pts) - 1
     start = end
-    while start > 0 and pts[start - 1][1] >= pts[start][1]:
+    while start > 0:
+        t_prev, p_prev = pts[start - 1]
+        t_cur, p_cur = pts[start]
+        if p_prev < p_cur:
+            break                        # window reset / refill
+        if p_prev - p_cur > max(3.0, max_step_rate * max(1.0, t_cur - t_prev)):
+            break                        # corrected watermark, not burn
         start -= 1
     run = pts[start:]
     if len(run) < 3:

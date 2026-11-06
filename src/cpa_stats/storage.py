@@ -240,7 +240,7 @@ def save_quota_history(conn, creds, ts: float) -> int:
             "(ts, name, provider, status, blocked, daily_pct, weekly_pct,"
             " daily_reset, weekly_reset, ok, fail, signals)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(ts, c.name, c.provider, c.status, int(c.blocked),
+            [(ts, c.name, c.provider, c.status, int(c.blocked or c.limited),
               c.daily_pct, c.weekly_pct, c.daily_reset, c.weekly_reset,
               c.ok, c.fail, json.dumps(c.signals or {})) for c in creds],
         )
@@ -259,7 +259,8 @@ def load_quota_history(conn, since_ts: float = 0, name: str | None = None):
         return []  # pre-v4 database without the table
 
 
-def load_rows(conn, since_ts: float, model: str | None = None, session: str | None = None, limit=None):
+def load_rows(conn, since_ts: float, model: str | None = None,
+              session: str | None = None, limit=None, account: str | None = None):
     sql = "SELECT * FROM requests WHERE ts >= ?"
     params: list = [since_ts]
     if model:
@@ -268,6 +269,9 @@ def load_rows(conn, since_ts: float, model: str | None = None, session: str | No
     if session:
         sql += " AND session_id LIKE ?"
         params.append(f"{session}%")
+    if account:
+        sql += " AND (source LIKE ? OR auth_index LIKE ?)"
+        params += [f"%{account}%"] * 2
     sql += " ORDER BY ts DESC"
     if limit:
         sql += f" LIMIT {int(limit)}"

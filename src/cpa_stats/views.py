@@ -8,8 +8,8 @@ from datetime import datetime
 from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
-                    bucket_counts, decode_tps, e2e_tps, field, group_by,
-                    parse_credentials, parse_iso_ts, quota_forecast,
+                    bucket_counts, cred_sort_key, decode_tps, e2e_tps, field,
+                    group_by, parse_credentials, parse_iso_ts, quota_forecast,
                     quota_pct_series, request_detail_pairs, short_endpoint,
                     short_model, token_parts)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
@@ -217,11 +217,12 @@ def build_alerts(agg: Agg, creds) -> "Text | None":
     """Red warning line(s): blocked credentials, high failure rate."""
     warns = []
     for c in creds:
-        if c.blocked:
+        if c.blocked or c.limited:
+            tag = "blocked" if c.blocked else "upstream limit reached"
             msg = c.status_message.split(":")[-1].strip()[:80]
-            weekly = (f"weekly {c.weekly_pct}%" if c.weekly_pct is not None
-                      else "quota exhausted")
-            warn = f"⚠ {c.account}: blocked ({weekly}"
+            weekly = (f"{c.weekly_label} {c.weekly_pct}%"
+                      if c.weekly_pct is not None else "quota exhausted")
+            warn = f"⚠ {c.account}: {tag} ({weekly}"
             if c.weekly_reset:
                 warn += f", resets in {fmt_countdown(c.weekly_reset - time.time())}"
             warn += f") — {msg}" if msg else ")"
@@ -252,12 +253,13 @@ def build_quota_table(creds, fetched_at=None, history=None):
     t.add_column("0% eta", no_wrap=True)
     t.add_column("signals", overflow="ellipsis", style="dim")
     from rich.markup import escape
-    for c in creds:
-        ok_state = c.status == "active" and not c.blocked
-        status_style = "green" if ok_state else ("red" if c.blocked
+    for c in sorted(creds, key=cred_sort_key):
+        ok_state = c.status == "active" and not c.blocked and not c.limited
+        status_style = "green" if ok_state else ("red" if c.blocked or c.limited
                                                  or c.status in ("error", "disabled") else "yellow")
-        status_txt = c.status + (" · blocked" if c.blocked else "")
-        resets = f"{_reset_str(c.daily_reset)} / {_reset_str(c.weekly_reset)}"
+        status_txt = c.status + (" · blocked" if c.blocked else "") \
+            + (" · limited" if c.limited else "")
+        resets = (f"{_reset_str(c.daily_reset)} / {_reset_str(c.weekly_reset)}")
         obs_age = parse_iso_ts(c.observed_at)
         obs_txt = (fmt_age(time.time() - obs_age).replace(" ago", "")
                    if obs_age else "—")
@@ -270,15 +272,19 @@ def build_quota_table(creds, fetched_at=None, history=None):
             styled(status_txt, status_style),
             Text.assemble(str(c.ok), "/", fail_cell),
             escape(c.plan) if c.plan else "—",
-            styled(f"{c.daily_pct}%", quota_style(c.daily_pct))
+            styled(f"{c.daily_pct}%" + (f" {c.daily_label}"
+                                        if c.daily_label not in ("daily", "")
+                                        else ""), quota_style(c.daily_pct))
             if c.daily_pct is not None else "—",
-            styled(f"{c.weekly_pct}%", quota_style(c.weekly_pct))
+            styled(f"{c.weekly_pct}%" + (f" {c.weekly_label}"
+                                         if c.weekly_label not in ("weekly", "")
+                                         else ""), quota_style(c.weekly_pct))
             if c.weekly_pct is not None else "—",
             styled(obs_txt, "yellow" if obs_age
                    and time.time() - obs_age > 300 else "dim"),
             resets if resets != "— / —" else "—",
             styled(_quota_eta((history or {}).get(c.name)) or "—",
-                   "bold red" if c.blocked else "dim"),
+                   "bold red" if c.blocked or c.limited else "dim"),
             extra,
         )
     if not creds:
@@ -422,7 +428,8 @@ def build_recent_table(rows, limit):
 
 def render_dashboard(conn, args, console):
     window_s = args.window
-    rows = load_rows(conn, time.time() - window_s, args.model, args.session)
+    rows = load_rows(conn, time.time() - window_s, args.model, args.session,
+                     account=getattr(args, "account", None))
     pricing = getattr(args, "pricing", None)
     agg = aggregate(rows, window_s, pricing)
     status, _ = collector_status(conn)
@@ -441,6 +448,8 @@ def render_dashboard(conn, args, console):
         title.append(f" · model~{args.model}", style="magenta")
     if args.session:
         title.append(f" · session {args.session}", style="magenta")
+    if getattr(args, "account", None):
+        title.append(f" · acct~{args.account}", style="magenta")
     right = Text()
     right.append_text(status)
     right.append(f"   {total} stored · {datetime.now().strftime('%H:%M:%S')}", style="dim")
@@ -512,7 +521,9 @@ def cmd_tail(args) -> None:
     console.print(Text("tailing requests (Ctrl-C to quit)", style="dim"))
     try:
         while True:
-            rows = list(reversed(load_rows(conn, last_ts - 1, args.model, args.session)))
+            rows = list(reversed(load_rows(conn, last_ts - 1, args.model,
+                                         args.session,
+                                         account=getattr(args, "account", None))))
             for r in rows:
                 if r["id"] in seen:
                     continue
@@ -598,7 +609,8 @@ def cmd_summary(args) -> None:
 
     conn = open_db_ro(args.db)
     console = Console()
-    rows = load_rows(conn, time.time() - args.since, args.model, args.session)
+    rows = load_rows(conn, time.time() - args.since, args.model, args.session,
+                     account=getattr(args, "account", None))
     agg = aggregate(rows, args.since, getattr(args, "pricing", None))
     console.print(Text(f"cpa-stats summary · last {window_label(args.since)}", style="bold cyan"))
     console.print(build_cards(agg, window_label(args.since)))
@@ -717,12 +729,20 @@ def cmd_quota(args) -> None:
     quota_hist = group_by(load_quota_history(conn), lambda r: r["name"])
     console.print(build_quota_table(creds, fetched, quota_hist))
     from rich.markup import escape
-    for c in creds:
+    for c in sorted(creds, key=cred_sort_key):
         lines = []
+        if c.limited:
+            lines.append("[red]limited[/]    upstream reports limit reached / rejected"
+                         + (f" · retry {_reset_str(c.retry_after_ts)}"
+                            if c.retry_after_ts else ""))
+        elif c.retry_after_ts:
+            lines.append(f"[yellow]retry[/]      upstream Retry-After "
+                         f"{_reset_str(c.retry_after_ts)}")
         if c.status_message:
             lines.append(f"[red]status[/]      {escape(c.status_message)}")
         hist = quota_hist.get(c.name) or []
-        for key, tag in (("daily_pct", "daily"), ("weekly_pct", "weekly")):
+        for key, tag in (("daily_pct", c.daily_label or "daily"),
+                         ("weekly_pct", c.weekly_label or "weekly")):
             series = quota_pct_series(hist, key)
             if len(series) >= 2:
                 trend = sparkline(series[-40:])
@@ -732,6 +752,29 @@ def cmd_quota(args) -> None:
                        else "· holding steady")
                 lines.append(f"[dim]{tag:>8}[/]     [cyan]{trend}[/] "
                              f"{escape(tag)} quota {series[-1]}% {escape(eta)}")
+        for lim in c.limits or []:
+            bits = []
+            for tag in ("short", "long"):
+                w = lim.get(tag)
+                if not w:
+                    continue
+                s = (f"{tag} {w['pct']}%" if w.get("pct") is not None
+                     else f"{tag} —")
+                if w.get("window"):
+                    s += f"/{w['window']}"
+                if w.get("reset"):
+                    s += f" resets {_reset_str(w['reset'])}"
+                if w.get("over_pct"):
+                    s += f" (+{w['over_pct']:.0f}% over)"
+                bits.append(s)
+            if lim.get("limited"):
+                bits.append("LIMITED")
+            lines.append(f"[dim]limit[/]      {escape(str(lim['label']))}: "
+                         + escape(" · ".join(bits)))
+        if c.credits:
+            rendered = " ".join(f"{escape(str(k))}={escape(str(v))}"
+                                for k, v in sorted(c.credits.items()))
+            lines.append(f"[dim]credits[/]    {rendered}")
         for k in sorted(c.signals or {}):
             lines.append(f"[dim]signal[/]      {escape(str(k))} = {escape(str(c.signals[k]))}")
         for cd in c.cooldowns or []:
@@ -806,7 +849,8 @@ def cmd_errors(args) -> None:
 
     conn = open_db_ro(args.db)
     console = Console()
-    rows = load_rows(conn, time.time() - args.since, args.model, args.session)
+    rows = load_rows(conn, time.time() - args.since, args.model, args.session,
+                     account=getattr(args, "account", None))
     fails = [r for r in rows if r["failed"]]
     console.print(Text(
         f"cpa-stats errors · last {window_label(args.since)} · "
@@ -834,4 +878,58 @@ def cmd_errors(args) -> None:
             model, str(status), escape(code or "—"), escape(short_endpoint(ep) or ep),
             str(len(grp)), datetime.fromtimestamp(last).strftime("%m-%d %H:%M:%S"),
             Text(escape(sample[:100]), style="red", overflow="ellipsis"))
+    console.print(t)
+
+
+def cmd_top(args) -> None:
+    """`cpa-stats top` — heaviest requests by tokens / output / cost / latency."""
+    need_rich()
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    console = Console()
+    rows = load_rows(conn, time.time() - args.since, args.model, args.session,
+                     account=getattr(args, "account", None))
+    pricing = getattr(args, "pricing", None)
+    scored = []
+    for r in rows:
+        total, uncached, read, _ = token_parts(r)
+        out_tok = r["output_tokens"] or 0
+        cost = (pricing.cost(uncached, read, out_tok)
+                if pricing and pricing.enabled else None)
+        scored.append((r, total + out_tok, out_tok, cost, r["latency_ms"] or 0))
+    idx = {"tokens": 1, "output": 2, "cost": 3, "latency": 4}[args.by]
+    scored.sort(key=lambda t: (t[idx] is None, -(t[idx] or 0)))
+    top = scored[:args.limit]
+    if not top:
+        console.print(Text(
+            f"cpa-stats top · last {window_label(args.since)} · "
+            "no requests in window", style="dim"))
+        return
+    console.print(Text(
+        f"cpa-stats top · last {window_label(args.since)} · by {args.by}",
+        style="bold cyan"))
+    t = Table(box=box.SIMPLE_HEAD, expand=True, title_justify="left")
+    for col, just in (("time", "left"), ("model", "left"), ("endpoint", "left"),
+                      ("account", "left"), ("session", "left"),
+                      ("in", "right"), ("hit", "right"), ("out", "right"),
+                      ("TTFT", "right"), ("lat", "right"), ("TPS", "right")):
+        t.add_column(col, justify=just)
+    if pricing and pricing.enabled:
+        t.add_column("cost", justify="right")
+    from rich.markup import escape
+    for r, _, _, cost, _lat in top:
+        tps = decode_tps(r["output_tokens"], r["latency_ms"], r["ttft_ms"])
+        total, _u, read, _w = token_parts(r)
+        ratio = read / total if total else None
+        t.add_row(
+            datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M:%S"),
+            escape(short_model(r)),
+            escape(short_endpoint(field(r, "endpoint")) or "—"),
+            escape(r["source"] or "—"),
+            escape((r["session_id"] or "")[-8:] or "—"),
+            fmt_tok(total), fmt_pct(ratio), fmt_tok(r["output_tokens"]),
+            fmt_ms(r["ttft_ms"]), fmt_ms(r["latency_ms"]), fmt_tps(tps),
+            *([fmt_cost(cost)] if pricing and pricing.enabled else []),
+        )
     console.print(t)

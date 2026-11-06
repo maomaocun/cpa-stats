@@ -26,9 +26,11 @@ Metrics
   reasoning   shown only when the upstream reports it; Devin does not (it is
               counted inside output tokens)
   quota       per-credential plan/quota signals from /management/credentials
-              (Devin: daily & weekly remaining % + reset times; Codex/Claude:
-              raw rate-limit header signals). Snapshotted by the collector into
-              the db so viewers never hit the management API themselves.
+              normalized across providers: Devin daily/weekly remaining %,
+              Codex x-codex-primary/secondary used-percent (+ named extra
+              limits and credits), Claude anthropic-ratelimit-unified-5h/7d
+              utilization. Snapshotted by the collector into the db so viewers
+              never hit the management API themselves.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
