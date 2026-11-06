@@ -274,6 +274,8 @@ def cmd_trend(args) -> None:
                        getattr(args, "pricing", None))
     metrics = ([m.strip() for m in args.metric.split(",") if m.strip()]
                if getattr(args, "metric", None) else list(TREND_METRICS))
+    if not metrics:
+        metrics = list(TREND_METRICS)
     bad = [m for m in metrics if m not in TREND_METRICS]
     if bad:
         from .collector import die

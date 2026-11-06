@@ -14,7 +14,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 from . import __version__, __doc__ as DOC
