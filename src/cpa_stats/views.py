@@ -214,10 +214,10 @@ TREND_METRICS = {
     "req":  ("req",      lambda a: float(a.n),              lambda v: f"{v:.0f}"),
     "fail": ("fail%",    lambda a: a.failed / a.n * 100 if a.n else None,
              lambda v: f"{v:.1f}%"),
-    "ttft": ("TTFT p50", lambda a: a.ttft_p50,              lambda v: fmt_ms(v)),
-    "lat":  ("lat p50",  lambda a: a.lat_p50,               lambda v: fmt_ms(v)),
-    "tps":  ("TPS p50",  lambda a: a.tps_p50,               lambda v: fmt_tps(v)),
-    "e2e":  ("e2e p50",  lambda a: a.e2e_p50,               lambda v: fmt_tps(v)),
+    "ttft": ("ttft",     lambda a: a.ttft_p50,              lambda v: fmt_ms(v)),
+    "lat":  ("lat",      lambda a: a.lat_p50,               lambda v: fmt_ms(v)),
+    "tps":  ("tps",      lambda a: a.tps_p50,               lambda v: fmt_tps(v)),
+    "e2e":  ("e2e",      lambda a: a.e2e_p50,               lambda v: fmt_tps(v)),
     "in":   ("in",       lambda a: float(a.in_tok),         lambda v: fmt_tok(v)),
     "out":  ("out",      lambda a: float(a.out_tok),        lambda v: fmt_tok(v)),
     "hit":  ("hit%",     lambda a: (a.cache_ratio * 100
@@ -276,6 +276,9 @@ def cmd_trend(args) -> None:
                if getattr(args, "metric", None) else list(TREND_METRICS))
     if not metrics:
         metrics = list(TREND_METRICS)
+    pricing = getattr(args, "pricing", None)
+    if not getattr(args, "metric", None) and not (pricing and pricing.enabled):
+        metrics = [m for m in metrics if m != "cost"]  # empty without --price
     bad = [m for m in metrics if m not in TREND_METRICS]
     if bad:
         from .collector import die
@@ -300,7 +303,7 @@ def cmd_trend(args) -> None:
         f"cpa-stats trend · last {window_label(span)} · "
         f"{window_label(bucket_s)} buckets · {sum(1 for a in aggs if a)} active",
         style="bold cyan"))
-    t = Table(box=box.SIMPLE_HEAD, expand=True)
+    t = Table(box=box.SIMPLE_HEAD)
     t.add_column("bucket", style="dim", no_wrap=True)
     for m in metrics:
         t.add_column(TREND_METRICS[m][0], justify="right")
