@@ -3,8 +3,8 @@
 from cpa_stats.model import (COLUMNS, MIN_DECODE_MS, Pricing, decode_tps,
                              e2e_tps, parse_credentials, parse_iso_ts,
                              parse_pricing, parse_pct, parse_ts, pct,
-                             record_to_row, request_detail_pairs, token_parts,
-                             token_quality)
+                             quota_forecast, quota_pct_series, record_to_row,
+                             request_detail_pairs, token_parts, token_quality)
 
 
 def rec(**kw):
@@ -325,3 +325,39 @@ class TestDetailPairs:
         assert "swe-2" in pairs["iterations [1]"]
         assert "web_search_calls 2" in pairs["server tools"]
         assert "$0.012" in pairs["upstream cost"]
+
+
+def hist(points, key="weekly_pct"):
+    """history rows from (hour_offset, pct) pairs, oldest first."""
+    import time
+    now = time.time()
+    return [{"ts": now - off * 3600, key: p} for off, p in reversed(points)]
+
+
+class TestQuotaForecast:
+    def test_decline(self):
+        # 81% -> 71% over 2h => ~5%/h -> eta ~14h out
+        import time
+        rows = hist([(2.0, 81), (1.0, 76), (0.0, 71)])
+        fc = quota_forecast(rows, "weekly_pct")
+        assert fc is not None
+        cur, per_day, eta = fc
+        assert cur == 71
+        assert abs(per_day - 5 * 24) < 1e-6
+        assert eta > time.time()
+
+    def test_reset_boundary(self):
+        # 100 -> 80 -> 0 (blocked) -> 100 (reset) -> 90: slope uses post-reset run only.
+        rows = hist([(4, 80), (3, 0), (2, 100), (1, 95), (0, 90)])
+        fc = quota_forecast(rows, "weekly_pct")
+        _, per_day, eta = fc
+        assert abs(per_day - 120) < 1e-6  # 5% per hour
+
+    def test_flat_or_insufficient(self):
+        assert quota_forecast(hist([(1, 50), (0, 50)]), "weekly_pct") is None
+        assert quota_forecast(hist([(0, 50)]), "weekly_pct") is None
+        assert quota_forecast([], "weekly_pct") is None
+
+    def test_series(self):
+        assert quota_pct_series(hist([(2, 90), (0, 80)]), "weekly_pct") == [90, 80]
+        assert quota_pct_series(hist([(2, None), (0, 80)]), "weekly_pct") == [80]

@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .storage import (insert_records, meta_set, open_db, prune,
-                      save_quota_snapshot)
+                      save_quota_history, save_quota_snapshot)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -239,11 +239,15 @@ def cmd_collect(args) -> None:
         if quota_every and time.time() - last_quota >= quota_every:
             try:
                 snap = fetch_credentials(cfg)
-                payload = {"fetched_at": time.time(),
+                now = time.time()
+                payload = {"fetched_at": now,
                            "observed_at": snap.get("observed_at"),
                            "files": snap.get("files") or []}
+                from .model import parse_credentials
+
                 with conn:
                     save_quota_snapshot(conn, payload)
+                    save_quota_history(conn, parse_credentials(payload), now)
                 if quota_err:
                     log("quota snapshot recovered")
                     quota_err = None

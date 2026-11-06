@@ -226,7 +226,8 @@ def main(argv=None) -> None:
     p.add_argument("--version", action="version", version=f"cpa-stats {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
-    from .views import cmd_quota, cmd_show, cmd_summary, cmd_tail, cmd_watch
+    from .views import (cmd_errors, cmd_quota, cmd_show, cmd_summary,
+                        cmd_tail, cmd_watch)
 
     w = sub.add_parser("watch", parents=[common, filters], help="live dashboard (default)")
     w.add_argument("-w", "--window", type=parse_duration, default=parse_duration("1h"),
@@ -266,6 +267,12 @@ def main(argv=None) -> None:
     q = sub.add_parser("quota", parents=[common],
                        help="credential quota/status snapshot collected from CPA")
     q.set_defaults(func=cmd_quota)
+
+    er = sub.add_parser("errors", parents=[common, filters],
+                        help="failure breakdown by model / status / code / endpoint")
+    er.add_argument("--since", type=parse_duration, default=parse_duration("24h"),
+                    help="window (default 24h)")
+    er.set_defaults(func=cmd_errors)
 
     sh = sub.add_parser("show", parents=[common],
                         help="full detail for one request (id / request_id / trace_id prefix)")

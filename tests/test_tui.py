@@ -138,3 +138,23 @@ async def test_quota_tab(db_with_quota):
         await pilot.pause()
         await pilot.press("escape")
         await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_session_filter_toggle(db):
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        tc = app.query_one("#right")
+        tc.active = "sessions"
+        await pilot.pause()
+        st = app.query_one("#sessions-table")
+        st.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.session_filter  # set after selecting a session row
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.session_filter == ""  # toggled off

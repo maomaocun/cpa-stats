@@ -277,3 +277,31 @@ class TestShowCmd:
         conn.close()
         with pytest.raises(SystemExit):
             main(["show", "--db", str(db), "nope"])
+
+
+class TestErrorsCmd:
+    def test_errors(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        recs = [make_rec(1), make_rec(2),
+                dict(make_rec(3), failed=True,
+                     fail={"status_code": 429, "body": "rate limited",
+                           "code": "rate_limit"},
+                     endpoint="POST /v1/responses")]
+        insert_records(conn, recs)
+        conn.close()
+        main(["errors", "--db", str(db), "--since", "1d"])
+        out = capsys.readouterr().out
+        assert "1/3 failed" in out
+        assert "429" in out and "rate_limit" in out
+        assert "limited" in out
+
+    def test_errors_empty(self, tmp_path, capsys):
+        db = tmp_path / "r.db"
+        conn = open_db(db)
+        from cpa_stats.storage import insert_records
+        insert_records(conn, [make_rec(1)])
+        conn.close()
+        main(["errors", "--db", str(db), "--since", "1d"])
+        assert "no failures" in capsys.readouterr().out

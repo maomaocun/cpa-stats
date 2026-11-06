@@ -9,9 +9,11 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
                     bucket_counts, decode_tps, e2e_tps, field, group_by,
-                    parse_credentials, parse_iso_ts, request_detail_pairs,
-                    short_endpoint, short_model, token_parts)
-from .storage import db_totals, load_quota_snapshot, load_rows, meta_get
+                    parse_credentials, parse_iso_ts, quota_forecast,
+                    quota_pct_series, request_detail_pairs, short_endpoint,
+                    short_model, token_parts)
+from .storage import (db_totals, load_quota_history, load_quota_snapshot,
+                      load_rows, meta_get)
 
 try:
     from rich import box
@@ -190,15 +192,49 @@ def build_activity(rows, window_s: float, buckets: int = 24):
     if window_s <= 0 or not rows:
         return None
     counts = bucket_counts(rows, time.time() - window_s, window_s / buckets, buckets)
+    tok = sum(token_parts(r)[0] + (r["output_tokens"] or 0) for r in rows)
     line = Text()
     line.append("activity ", style="dim")
     line.append(sparkline(counts), style="cyan")
-    line.append(f"  {sum(counts)} req · peak {max(counts)}/{window_s / buckets / 60:.0f}min bucket",
-                style="dim")
+    line.append(f"  {sum(counts)} req · peak {max(counts)}/{window_s / buckets / 60:.0f}min bucket"
+                f" · {fmt_tok(tok / (window_s / 3600))} tok/h", style="dim")
     return line
 
 
-def build_quota_table(creds, fetched_at=None):
+def _quota_eta(history_for_cred):
+    """'w −3%/d → 0 in 2d1h' forecast text from history rows; '' when unknown."""
+    if not history_for_cred:
+        return ""
+    for key, tag in (("weekly_pct", "w"), ("daily_pct", "d")):
+        fc = quota_forecast(history_for_cred, key)
+        if fc:
+            _, per_day, eta = fc
+            return f"{tag} −{per_day:.0f}%/d → 0 in {fmt_countdown(eta - time.time())}"
+    return ""
+
+
+def build_alerts(agg: Agg, creds) -> "Text | None":
+    """Red warning line(s): blocked credentials, high failure rate."""
+    warns = []
+    for c in creds:
+        if c.blocked:
+            msg = c.status_message.split(":")[-1].strip()[:80]
+            weekly = (f"weekly {c.weekly_pct}%" if c.weekly_pct is not None
+                      else "quota exhausted")
+            warn = f"⚠ {c.account}: blocked ({weekly}"
+            if c.weekly_reset:
+                warn += f", resets in {fmt_countdown(c.weekly_reset - time.time())}"
+            warn += f") — {msg}" if msg else ")"
+            warns.append(warn)
+    if agg.n and agg.failed / agg.n > 0.05:
+        warns.append(f"⚠ {agg.failed}/{agg.n} requests failed in window "
+                     f"({agg.failed / agg.n * 100:.1f}%)")
+    if not warns:
+        return None
+    return Text("\n".join(warns), style="bold red")
+
+
+def build_quota_table(creds, fetched_at=None, history=None):
     """Per-credential quota / status table (accounts · quota)."""
     title = "accounts · quota"
     if fetched_at:
@@ -212,6 +248,7 @@ def build_quota_table(creds, fetched_at=None):
     t.add_column("daily", justify="right")
     t.add_column("weekly", justify="right")
     t.add_column("reset d·w", no_wrap=True)
+    t.add_column("0% eta", no_wrap=True)
     t.add_column("signals", overflow="ellipsis", style="dim")
     from rich.markup import escape
     for c in creds:
@@ -234,6 +271,8 @@ def build_quota_table(creds, fetched_at=None):
             styled(f"{c.weekly_pct}%", quota_style(c.weekly_pct))
             if c.weekly_pct is not None else "—",
             resets if resets != "— / —" else "—",
+            styled(_quota_eta((history or {}).get(c.name)) or "—",
+                   "bold red" if c.blocked else "dim"),
             extra,
         )
     if not creds:
@@ -385,6 +424,7 @@ def render_dashboard(conn, args, console):
     total = totals.n
     snap = load_quota_snapshot(conn)
     creds = parse_credentials(snap)
+    quota_hist = group_by(load_quota_history(conn), lambda r: r["name"])
     header = Table.grid(expand=True)
     header.add_column()
     header.add_column(justify="right")
@@ -422,7 +462,11 @@ def render_dashboard(conn, args, console):
     if act is not None:
         parts.append(act)
     if creds:
-        parts.append(build_quota_table(creds, (snap or {}).get("fetched_at")))
+        alerts = build_alerts(agg, creds)
+        if alerts:
+            parts.append(alerts)
+        parts.append(build_quota_table(creds, (snap or {}).get("fetched_at"),
+                                       quota_hist))
     else:
         parts.append(Text("quota: no credentials snapshot yet — restart "
                           "`cpa-stats collect` to populate (every --quota-interval s)",
@@ -615,7 +659,9 @@ def cmd_summary(args) -> None:
     snap = load_quota_snapshot(conn)
     creds = parse_credentials(snap)
     if creds:
-        console.print(build_quota_table(creds, snap.get("fetched_at")))
+        quota_hist = group_by(load_quota_history(conn), lambda r: r["name"])
+        console.print(build_quota_table(creds, snap.get("fetched_at"),
+                                        quota_hist))
 
 
 def cmd_quota(args) -> None:
@@ -638,12 +684,24 @@ def cmd_quota(args) -> None:
         f"cpa-stats quota · {len(creds)} credential(s)"
         + (f" · snapshot {fmt_age(time.time() - fetched)}" if fetched else ""),
         style="bold cyan"))
-    console.print(build_quota_table(creds, fetched))
+    quota_hist = group_by(load_quota_history(conn), lambda r: r["name"])
+    console.print(build_quota_table(creds, fetched, quota_hist))
     from rich.markup import escape
     for c in creds:
         lines = []
         if c.status_message:
             lines.append(f"[red]status[/]      {escape(c.status_message)}")
+        hist = quota_hist.get(c.name) or []
+        for key, tag in (("daily_pct", "daily"), ("weekly_pct", "weekly")):
+            series = quota_pct_series(hist, key)
+            if len(series) >= 2:
+                trend = sparkline(series[-40:])
+                fc = quota_forecast(hist, key)
+                eta = (f"· −{fc[1]:.0f}%/day → 0% in "
+                       f"{fmt_countdown(fc[2] - time.time())}" if fc
+                       else "· holding steady")
+                lines.append(f"[dim]{tag:>8}[/]     [cyan]{trend}[/] "
+                             f"{escape(tag)} quota {series[-1]}% {escape(eta)}")
         for k in sorted(c.signals or {}):
             lines.append(f"[dim]signal[/]      {escape(str(k))} = {escape(str(c.signals[k]))}")
         for cd in c.cooldowns or []:
@@ -709,3 +767,41 @@ def cmd_show(args) -> None:
                 console.print_json(raw)
             except ValueError:
                 console.print(raw)
+
+
+def cmd_errors(args) -> None:
+    """`cpa-stats errors` — failures grouped by model / status / fail code."""
+    need_rich()
+    from .storage import open_db_ro
+
+    conn = open_db_ro(args.db)
+    console = Console()
+    rows = load_rows(conn, time.time() - args.since, args.model, args.session)
+    fails = [r for r in rows if r["failed"]]
+    console.print(Text(
+        f"cpa-stats errors · last {window_label(args.since)} · "
+        f"{len(fails)}/{len(rows)} failed"
+        + (f" ({len(fails) / len(rows) * 100:.1f}%)" if rows else ""),
+        style="bold cyan"))
+    if not fails:
+        console.print(Text("no failures in window", style="dim"))
+        return
+    groups = group_by(fails, lambda r: (
+        short_model(r), r["status_code"] or 0, field(r, "fail_code") or "",
+        r["endpoint"] or ""))
+    t = Table(box=box.SIMPLE_HEAD, expand=True, title="by model · status · code · endpoint",
+              title_style="bold red", title_justify="left")
+    for col, just in (("model", "left"), ("status", "right"), ("code", "left"),
+                      ("endpoint", "left"), ("count", "right"), ("last", "right"),
+                      ("sample error", "left")):
+        t.add_column(col, justify=just)
+    from rich.markup import escape
+    for (model, status, code, ep), grp in sorted(groups.items(),
+                                                key=lambda kv: -len(kv[1])):
+        last = max(r["ts"] for r in grp)
+        sample = next((r["error"] for r in grp if r["error"]) or "")
+        t.add_row(
+            model, str(status), escape(code or "—"), escape(short_endpoint(ep) or ep),
+            str(len(grp)), datetime.fromtimestamp(last).strftime("%m-%d %H:%M:%S"),
+            Text(escape(sample[:100]), style="red", overflow="ellipsis"))
+    console.print(t)

@@ -7,8 +7,9 @@ import pytest
 
 from cpa_stats.model import aggregate, parse_pricing, record_to_row
 from cpa_stats.storage import (SCHEMA_VERSION, db_totals, insert_records,
-                               load_quota_snapshot, load_rows, meta_get,
-                               open_db, prune, save_quota_snapshot)
+                               load_quota_history, load_quota_snapshot,
+                               load_rows, meta_get, open_db, prune,
+                               save_quota_history, save_quota_snapshot)
 
 
 def rec(i, **kw):
@@ -148,6 +149,43 @@ class TestQuotaSnapshot:
         meta_set(db, "credentials_snapshot", "{not json")
         db.commit()
         assert load_quota_snapshot(db) is None
+
+
+class TestQuotaHistory:
+    def _cred(self, name="a.json", weekly=81):
+        from cpa_stats.model import parse_credentials
+        return parse_credentials({"files": [{
+            "name": name, "provider": "devin", "status": "active",
+            "success": 5, "failed": 1,
+            "quota": {"signals": {"plan": "Max",
+                                  "weekly_quota_remaining_percent": f"{weekly}%",
+                                  "daily_quota_remaining_percent": "100%"}}}]})[0]
+
+    def test_table_created(self, db):
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(quota_history)")}
+        assert {"ts", "name", "weekly_pct", "daily_pct", "blocked"} <= cols
+
+    def test_roundtrip(self, db):
+        import time
+        save_quota_history(db, [self._cred(), self._cred("b.json", 40)],
+                           time.time())
+        rows = load_quota_history(db)
+        assert len(rows) == 2
+        assert rows[0]["weekly_pct"] == 81
+        b = load_quota_history(db, name="b.json")
+        assert len(b) == 1 and b[0]["weekly_pct"] == 40
+
+    def test_missing_table_returns_empty(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "bare.db"))
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        assert load_quota_history(conn) == []
+
+    def test_prune_drops_history(self, db):
+        import time
+        save_quota_history(db, [self._cred()], time.time())
+        assert prune(db, 0) >= 0
+        assert load_quota_history(db) == []
 
 
 class TestInsert:

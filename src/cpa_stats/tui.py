@@ -13,6 +13,7 @@ Keys
     tab       cycle focus between panels
     enter     detail modal (request or credential)
     f         filter (model substring)
+    enter on sessions row  filter everything to that session (again to clear)
     p         pause / resume refresh
     r         force refresh
     q         quit
@@ -28,9 +29,10 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
                     decode_tps, e2e_tps, field, group_by, parse_credentials,
-                    request_detail_pairs, short_endpoint, short_model,
-                    token_parts)
-from .storage import db_totals, load_quota_snapshot, load_rows, meta_get
+                    quota_forecast, quota_pct_series, request_detail_pairs,
+                    short_endpoint, short_model, token_parts)
+from .storage import (db_totals, load_quota_history, load_quota_snapshot,
+                      load_rows, meta_get)
 
 WINDOWS = {  # key -> seconds
     "1": ("15m", 15 * 60),
@@ -76,9 +78,10 @@ def build_app():
 
         BINDINGS = [Binding("escape,q,enter", "dismiss", "close")]
 
-        def __init__(self, cred):
+        def __init__(self, cred, history=None):
             super().__init__()
             self.cred = cred
+            self.history = history or []
 
         def compose(self):
             c = self.cred
@@ -88,6 +91,16 @@ def build_app():
             if c.status_message:
                 lines.append(f"[dim]{'message':>16}[/]  [red]{escape(c.status_message)}[/]")
             lines.append(f"[dim]{'requests':>16}[/]  {c.ok} ok · {c.fail} failed")
+            for key, tag in (("daily_pct", "daily"), ("weekly_pct", "weekly")):
+                series = quota_pct_series(self.history, key)
+                if len(series) >= 2:
+                    fc = quota_forecast(self.history, key)
+                    eta = (f" −{fc[1]:.0f}%/day → 0% in "
+                           f"{fmt_countdown(fc[2] - time.time())}" if fc
+                           else " · steady")
+                    lines.append(
+                        f"[dim]{tag:>16}[/]  [cyan]{sparkline(series[-40:])}[/]"
+                        f"  {series[-1]}%{escape(eta)}")
             for k in sorted(c.signals or {}):
                 lines.append(f"[dim]{'signal':>16}[/]  {escape(str(k))} = {escape(str(c.signals[k]))}")
             for cd in c.cooldowns or []:
@@ -166,6 +179,7 @@ def build_app():
         window_key = reactive("2")
         paused = reactive(False)
         model_filter = reactive("")
+        session_filter = reactive("")
 
         def __init__(self, db_path, pricing=None, refresh_s=2.0):
             super().__init__()
@@ -174,6 +188,7 @@ def build_app():
             self.refresh_s = refresh_s
             self.rows = []
             self.creds = []
+            self.creds_hist = {}
             self.conn = None
 
         def compose(self) -> ComposeResult:
@@ -224,8 +239,11 @@ def build_app():
             if not self.conn:
                 return
             since = time.time() - self._window_s()
-            self.rows = load_rows(self.conn, since, self.model_filter or None)
+            self.rows = load_rows(self.conn, since, self.model_filter or None,
+                                  self.session_filter or None)
             self.creds = parse_credentials(load_quota_snapshot(self.conn))
+            self.creds_hist = group_by(load_quota_history(self.conn),
+                                       lambda r: r["name"])
             self._render_all()
 
         # ------------------------------------------------------------ render
@@ -242,7 +260,7 @@ def build_app():
                           "lat p50", "last")
             qt = self.query_one("#quota-table", DataTable)
             qt.add_columns("account", "status", "ok/fail", "plan",
-                           "daily", "weekly", "resets d/w", "signals")
+                           "daily", "weekly", "resets d/w", "0% eta", "signals")
 
         def _card(self, title, value, sub=""):
             return Static(
@@ -283,6 +301,8 @@ def build_app():
                 f"{coll}   window [bold]{WINDOWS[self.window_key][0]}[/]"
                 f"   {totals.n} stored"
                 + _quota_chip(self.creds)
+                + (f"   [magenta]sess {self.session_filter[-8:]}[/]"
+                   if self.session_filter else "")
                 + (f"   filter [magenta]{self.model_filter}[/]" if self.model_filter else "")
                 + ("   [yellow]PAUSED[/]" if self.paused else ""))
 
@@ -314,10 +334,13 @@ def build_app():
             # --- activity sparkline
             counts = bucket_counts(rows, time.time() - self._window_s(),
                                    self._window_s() / 40, 40)
+            tok_h = (sum(token_parts(r)[0] + (r["output_tokens"] or 0)
+                         for r in rows) / (self._window_s() / 3600))
             act = self.query_one("#activity", Static)
             act.update(
                 f"activity {sparkline(counts)}  "
-                f"[dim]{sum(counts)} req · peak {max(counts)}/bucket "
+                f"[dim]{sum(counts)} req · peak {max(counts)}/bucket"
+                f" · {fmt_tok(tok_h)} tok/h "
                 f"· tokens clean {fmt_pct(agg.quality_ratio)}[/]")
 
             # --- per model
@@ -378,12 +401,13 @@ def build_app():
                 resets = f"{_fmt_reset(c.daily_reset)}/{_fmt_reset(c.weekly_reset)}"
                 extra = " ".join(f"{k}={v}" for k, v in
                                  list((c.extra or {}).items())[:8])
+                eta = _quota_eta_text(self.creds_hist.get(c.name))
                 qt.add_row(
                     c.account + (f" · {c.provider}" if c.provider else ""), state,
                     f"{c.ok}/{c.fail}", c.plan or "—",
                     f"{c.daily_pct}%" if c.daily_pct is not None else "—",
                     f"{c.weekly_pct}%" if c.weekly_pct is not None else "—",
-                    resets if resets != "—/—" else "—",
+                    resets if resets != "—/—" else "—", eta or "—",
                     extra or "—", key=c.name)
 
             # --- totals pane
@@ -476,9 +500,36 @@ def build_app():
             elif event.data_table.id == "quota-table":
                 cred = self._selected_cred()
                 if cred:
-                    self.push_screen(CredScreen(cred))
+                    self.push_screen(CredScreen(
+                        cred, self.creds_hist.get(cred.name)))
+            elif event.data_table.id == "sessions-table":
+                sid = self._selected_session()
+                if sid:
+                    self.session_filter = ("" if self.session_filter == sid
+                                           else sid)
+                    self.refresh_data()
+
+        def _selected_session(self):
+            st = self.query_one("#sessions-table", DataTable)
+            if st.cursor_row is None or st.cursor_row >= len(st.rows):
+                return None
+            try:
+                return st.coordinate_to_cell_key(
+                    st.cursor_coordinate).row_key.value
+            except Exception:
+                return None
 
     return StatsApp
+
+
+def _quota_eta_text(history_for_cred):
+    if not history_for_cred:
+        return ""
+    for key, tag in (("weekly_pct", "w"), ("daily_pct", "d")):
+        fc = quota_forecast(history_for_cred, key)
+        if fc:
+            return f"{tag} −{fc[1]:.0f}%/d → 0 in {fmt_countdown(fc[2] - time.time())}"
+    return ""
 
 
 def _fmt_reset(ts):

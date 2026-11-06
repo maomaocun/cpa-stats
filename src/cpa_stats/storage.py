@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .model import INSERT_SQL, Agg
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -65,7 +65,42 @@ CREATE TABLE IF NOT EXISTS requests (
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_model_ts ON requests(model, ts);
 CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
+CREATE TABLE IF NOT EXISTS quota_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL NOT NULL,
+    name         TEXT,
+    provider     TEXT,
+    status       TEXT,
+    blocked      INTEGER,
+    daily_pct    INTEGER,
+    weekly_pct   INTEGER,
+    daily_reset  REAL,
+    weekly_reset REAL,
+    ok           INTEGER,
+    fail         INTEGER,
+    signals      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quota_history_ts ON quota_history(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+_QUOTA_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS quota_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL NOT NULL,
+    name         TEXT,
+    provider     TEXT,
+    status       TEXT,
+    blocked      INTEGER,
+    daily_pct    INTEGER,
+    weekly_pct   INTEGER,
+    daily_reset  REAL,
+    weekly_reset REAL,
+    ok           INTEGER,
+    fail         INTEGER,
+    signals      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quota_history_ts ON quota_history(ts);
 """
 
 # v3 columns -> path inside the raw JSON record, used for the backfill.
@@ -114,6 +149,7 @@ MIGRATIONS[2] = [
                 for col, path in _V3_JSON_PATHS.items())
     + " WHERE json_valid(raw)"
 ]
+MIGRATIONS[3] = [s for s in _QUOTA_HISTORY_SCHEMA.strip().split(";\n") if s.strip()]
 
 
 def open_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -196,6 +232,33 @@ def load_quota_snapshot(conn) -> dict | None:
     return data if isinstance(data, dict) else {"files": data}
 
 
+def save_quota_history(conn, creds, ts: float) -> int:
+    """One history row per credential per poll — enables burn-rate forecasts."""
+    with conn:
+        cur = conn.executemany(
+            "INSERT INTO quota_history"
+            "(ts, name, provider, status, blocked, daily_pct, weekly_pct,"
+            " daily_reset, weekly_reset, ok, fail, signals)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(ts, c.name, c.provider, c.status, int(c.blocked),
+              c.daily_pct, c.weekly_pct, c.daily_reset, c.weekly_reset,
+              c.ok, c.fail, json.dumps(c.signals or {})) for c in creds],
+        )
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def load_quota_history(conn, since_ts: float = 0, name: str | None = None):
+    sql = "SELECT * FROM quota_history WHERE ts >= ?"
+    params: list = [since_ts]
+    if name:
+        sql += " AND name = ?"
+        params.append(name)
+    try:
+        return conn.execute(sql + " ORDER BY ts", params).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-v4 database without the table
+
+
 def load_rows(conn, since_ts: float, model: str | None = None, session: str | None = None, limit=None):
     sql = "SELECT * FROM requests WHERE ts >= ?"
     params: list = [since_ts]
@@ -264,6 +327,7 @@ def prune(conn, older_than_s: float) -> int:
     cutoff = time.time() - older_than_s
     with conn:
         n = conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,)).rowcount
+        conn.execute("DELETE FROM quota_history WHERE ts < ?", (cutoff,))
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return n
 
