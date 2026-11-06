@@ -65,13 +65,12 @@ def load_cpa_config(args) -> CPAConfig:
         url = f"http://127.0.0.1:{m.group(1)}"
     key = os.environ.get("CPA_MGMT_KEY")
     if not key:
-        if not cpa_dir:
-            die("cannot locate management.key; set CPA_MGMT_KEY, --mgmt-key-file or --cpa-dir")
-        key_file = Path(os.path.expanduser(
-            args.mgmt_key_file or cpa_dir / "management.key"))
+        key_file = Path(os.path.expanduser(str(
+            args.mgmt_key_file or (cpa_dir / "management.key" if cpa_dir else ""))))
         if not key_file.exists():
-            die(f"cannot find management key file {key_file}; "
-                "set CPA_MGMT_KEY or --mgmt-key-file")
+            die("cannot locate management.key; set CPA_MGMT_KEY, "
+                "--mgmt-key-file or --cpa-dir"
+                + (f" (tried {key_file})" if args.mgmt_key_file else ""))
         key = key_file.read_text().strip()
     return CPAConfig(url=url.rstrip("/"), mgmt_key=key)
 
