@@ -247,6 +247,7 @@ def build_quota_table(creds, fetched_at=None, history=None):
     t.add_column("plan", style="dim")
     t.add_column("daily", justify="right")
     t.add_column("weekly", justify="right")
+    t.add_column("data", justify="right", style="dim")
     t.add_column("reset d·w", no_wrap=True)
     t.add_column("0% eta", no_wrap=True)
     t.add_column("signals", overflow="ellipsis", style="dim")
@@ -257,6 +258,9 @@ def build_quota_table(creds, fetched_at=None, history=None):
                                                  or c.status in ("error", "disabled") else "yellow")
         status_txt = c.status + (" · blocked" if c.blocked else "")
         resets = f"{_reset_str(c.daily_reset)} / {_reset_str(c.weekly_reset)}"
+        obs_age = parse_iso_ts(c.observed_at)
+        obs_txt = (fmt_age(time.time() - obs_age).replace(" ago", "")
+                   if obs_age else "—")
         extra = " ".join(f"{escape(str(k))}={escape(str(v))}"
                          for k, v in list((c.extra or {}).items())[:8]) or "—"
         fail_cell = styled(str(c.fail), "red" if c.fail else "dim")
@@ -270,6 +274,8 @@ def build_quota_table(creds, fetched_at=None, history=None):
             if c.daily_pct is not None else "—",
             styled(f"{c.weekly_pct}%", quota_style(c.weekly_pct))
             if c.weekly_pct is not None else "—",
+            styled(obs_txt, "yellow" if obs_age
+                   and time.time() - obs_age > 300 else "dim"),
             resets if resets != "— / —" else "—",
             styled(_quota_eta((history or {}).get(c.name)) or "—",
                    "bold red" if c.blocked else "dim"),
@@ -667,10 +673,34 @@ def cmd_summary(args) -> None:
 def cmd_quota(args) -> None:
     """`cpa-stats quota` — full credential snapshot: quota, cooldowns, signals."""
     need_rich()
-    from .storage import open_db_ro
+    from .storage import open_db, open_db_ro
 
-    conn = open_db_ro(args.db)
-    snap = load_quota_snapshot(conn)
+    conn = open_db(args.db) if getattr(args, "refresh", False) else open_db_ro(args.db)
+    snap = None
+    if getattr(args, "refresh", False):
+        from .collector import (fetch_credentials, load_cpa_config,
+                                refresh_credential, stale_quota_credentials)
+        from .storage import save_quota_history, save_quota_snapshot
+
+        cfg = load_cpa_config(args)
+        snap = fetch_credentials(cfg)
+        names = stale_quota_credentials(snap, 0.0, time.time())
+        if names:
+            errs = [e for e in (refresh_credential(cfg, n) for n in names)
+                    if e is not None]
+            if errs:
+                console_err = Console(stderr=True)
+                console_err.print(
+                    Text(f"quota refresh failed for "
+                         f"{len(errs)}/{len(names)}: {errs[0]}", style="yellow"))
+            snap = fetch_credentials(cfg)
+        payload = {"fetched_at": time.time(),
+                   "observed_at": snap.get("observed_at"),
+                   "files": snap.get("files") or []}
+        with conn:
+            save_quota_snapshot(conn, payload)
+            save_quota_history(conn, parse_credentials(payload), time.time())
+    snap = snap or load_quota_snapshot(conn)
     console = Console()
     if not snap or not isinstance(snap.get("files"), list):
         console.print(Text(

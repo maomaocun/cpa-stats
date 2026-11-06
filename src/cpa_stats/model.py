@@ -427,34 +427,44 @@ def parse_credentials(snap) -> list[CredInfo]:
     return out
 
 
-def quota_forecast(history_rows, key: str = "weekly_pct"):
+def quota_forecast(history_rows, key: str = "weekly_pct", min_span_s: float = 1800):
     """Burn-rate forecast for one credential's history rows (ts ascending).
 
-    Returns (current_pct, pct_drop_per_day, eta_ts) or None when there aren't
-    enough points or the quota isn't shrinking. A rising value between two
-    polls means a window reset, so only the trailing non-increasing run is
-    used for the slope.
+    Returns (current_pct, pct_drop_per_day, eta_ts) or None when the quota
+    isn't shrinking or history is too thin. A rising value between two polls
+    means a window reset, so only the trailing non-increasing run is fitted.
+    The slope is least-squares over that run and requires `min_span_s` of
+    coverage (30 min default) — quota is consumed in bursts, so a slope from
+    a couple of minutes is meaningless noise.
     """
     pts = sorted(
         (r["ts"], r[key]) for r in history_rows
         if r["ts"] is not None and r[key] is not None
     )
-    if len(pts) < 2:
+    if len(pts) < 3:
         return None
     end = len(pts) - 1
     start = end
     while start > 0 and pts[start - 1][1] >= pts[start][1]:
         start -= 1
     run = pts[start:]
-    if len(run) < 2:
+    if len(run) < 3:
         return None
     (t0, p0), (t1, p1) = run[0], run[-1]
-    dt_days = (t1 - t0) / 86400.0
-    drop = p0 - p1
-    if dt_days <= 0 or drop <= 0:
+    if t1 - t0 < min_span_s or p1 >= p0:
         return None
-    per_day = drop / dt_days
-    return p1, per_day, t1 + (p1 / per_day) * 86400.0
+    n = len(run)
+    sx = sum(t for t, _ in run)
+    sy = sum(p for _, p in run)
+    sxx = sum(t * t for t, _ in run)
+    sxy = sum(t * p for t, p in run)
+    denom = n * sxx - sx * sx
+    if denom <= 0:
+        return None
+    slope = (n * sxy - sx * sy) / denom  # pct per second, negative = draining
+    if slope >= 0:
+        return None
+    return p1, -slope * 86400.0, t1 + p1 / -slope
 
 
 def quota_pct_series(history_rows, key: str = "weekly_pct") -> list:

@@ -266,6 +266,9 @@ def main(argv=None) -> None:
 
     q = sub.add_parser("quota", parents=[common],
                        help="credential quota/status snapshot collected from CPA")
+    q.add_argument("-r", "--refresh", action="store_true",
+                   help="force CPA to re-observe credentials upstream first "
+                        "(POST /credentials/refresh), then store + show")
     q.set_defaults(func=cmd_quota)
 
     er = sub.add_parser("errors", parents=[common, filters],
@@ -294,6 +297,10 @@ def main(argv=None) -> None:
     c.add_argument("--quota-interval", type=float, default=60.0,
                    help="also snapshot /credentials quota+status every N seconds "
                         "(0 = off)")
+    c.add_argument("--quota-refresh", type=float, default=300.0,
+                   help="force-refresh quota-observable credentials whose data "
+                        "is older than N seconds before snapshotting "
+                        "(0 = never refresh, default 300)")
     c.add_argument("--retention-days", type=float, default=90,
                    help="delete records older than this, checked hourly (0 = keep forever)")
     c.add_argument("--once", action="store_true", help="drain once and exit")

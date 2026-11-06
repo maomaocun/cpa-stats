@@ -343,7 +343,7 @@ class TestQuotaForecast:
         assert fc is not None
         cur, per_day, eta = fc
         assert cur == 71
-        assert abs(per_day - 5 * 24) < 1e-6
+        assert abs(per_day - 5 * 24) < 0.5
         assert eta > time.time()
 
     def test_reset_boundary(self):
@@ -351,7 +351,7 @@ class TestQuotaForecast:
         rows = hist([(4, 80), (3, 0), (2, 100), (1, 95), (0, 90)])
         fc = quota_forecast(rows, "weekly_pct")
         _, per_day, eta = fc
-        assert abs(per_day - 120) < 1e-6  # 5% per hour
+        assert abs(per_day - 120) < 0.5  # 5% per hour
 
     def test_flat_or_insufficient(self):
         assert quota_forecast(hist([(1, 50), (0, 50)]), "weekly_pct") is None

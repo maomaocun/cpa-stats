@@ -88,8 +88,19 @@ CREDENTIALS_PATHS = (
     "/v0/management/auth-files",
 )
 
+# POST to force CPA to re-observe a credential (Devin: re-runs GetUserStatus).
+CREDENTIALS_REFRESH_PATHS = (
+    "/v8/management/credentials/refresh",
+    "/v0/management/auth-files/refresh",
+)
+
+# Providers whose quota signals CPA can observe (mirrors
+# ProviderSupportsQuotaObservation upstream).
+QUOTA_PROVIDERS = {"claude", "codex", "devin"}
+
 _usage_queue_path: str | None = None
 _credentials_path: str | None = None
+_credentials_refresh_path: str | None = None
 
 
 def _mgmt_get(cfg: CPAConfig, path: str, timeout: float):
@@ -150,6 +161,56 @@ def fetch_credentials(cfg: CPAConfig, timeout: float = 10.0) -> dict:
     if last_err:
         raise last_err
     return {"files": []}
+
+
+def refresh_credential(cfg: CPAConfig, name: str, timeout: float = 15.0):
+    """POST /credentials/refresh?name — CPA re-observes the credential upstream.
+    Returns None on success, the HTTPError otherwise."""
+    global _credentials_refresh_path
+    candidates = ([_credentials_refresh_path] if _credentials_refresh_path
+                  else list(CREDENTIALS_REFRESH_PATHS))
+    body = json.dumps({"name": name}).encode()
+    last_err = None
+    for path in candidates:
+        req = urllib.request.Request(
+            f"{cfg.url}{path}", data=body, method="POST",
+            headers={"Authorization": f"Bearer {cfg.mgmt_key}",
+                     "Content-Type": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                resp.read()
+            _credentials_refresh_path = path
+            return None
+        except urllib.error.HTTPError as exc:
+            last_err = exc
+            if exc.code == 404:
+                continue
+            return exc
+        except (urllib.error.URLError, OSError) as exc:
+            return exc
+    return last_err
+
+
+def stale_quota_credentials(snap: dict, max_age_s: float, now: float) -> list[str]:
+    """Names of quota-observable credentials whose signals are older than
+    max_age_s (or never observed)."""
+    from .model import parse_iso_ts
+
+    stale = []
+    for f in snap.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        provider = str(f.get("provider") or f.get("type") or "").lower()
+        if provider not in QUOTA_PROVIDERS:
+            continue
+        quota = f.get("quota") if isinstance(f.get("quota"), dict) else {}
+        observed = parse_iso_ts(quota.get("observed_at"))
+        if observed is None or now - observed > max_age_s:
+            name = f.get("name") or f.get("id")
+            if name:
+                stale.append(str(name))
+    return stale
 
 
 def cmd_collect(args) -> None:
@@ -238,8 +299,17 @@ def cmd_collect(args) -> None:
             backoff = min(max(backoff * 2, args.interval), 30)
         if quota_every and time.time() - last_quota >= quota_every:
             try:
-                snap = fetch_credentials(cfg)
                 now = time.time()
+                snap = fetch_credentials(cfg)
+                if args.quota_refresh:
+                    stale = stale_quota_credentials(snap, args.quota_refresh, now)
+                    if stale:
+                        errs = [e for e in (refresh_credential(cfg, n)
+                                            for n in stale) if e is not None]
+                        snap = fetch_credentials(cfg)  # re-read post-refresh
+                        if errs:
+                            log(f"quota refresh: {len(errs)}/{len(stale)} "
+                                f"failed ({errs[0]})")
                 payload = {"fetched_at": now,
                            "observed_at": snap.get("observed_at"),
                            "files": snap.get("files") or []}

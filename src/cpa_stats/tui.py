@@ -29,8 +29,9 @@ from .format import (fmt_age, fmt_cost, fmt_countdown, fmt_ms, fmt_pct, fmt_tok,
                      fmt_tps, sparkline, window_label)
 from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, aggregate, bucket_counts,
                     decode_tps, e2e_tps, field, group_by, parse_credentials,
-                    quota_forecast, quota_pct_series, request_detail_pairs,
-                    short_endpoint, short_model, token_parts)
+                    parse_iso_ts, quota_forecast, quota_pct_series,
+                    request_detail_pairs, short_endpoint, short_model,
+                    token_parts)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -260,7 +261,8 @@ def build_app():
                           "lat p50", "last")
             qt = self.query_one("#quota-table", DataTable)
             qt.add_columns("account", "status", "ok/fail", "plan",
-                           "daily", "weekly", "resets d/w", "0% eta", "signals")
+                           "daily", "weekly", "data", "resets d/w", "0% eta",
+                           "signals")
 
         def _card(self, title, value, sub=""):
             return Static(
@@ -402,11 +404,14 @@ def build_app():
                 extra = " ".join(f"{k}={v}" for k, v in
                                  list((c.extra or {}).items())[:8])
                 eta = _quota_eta_text(self.creds_hist.get(c.name))
+                obs = parse_iso_ts(c.observed_at)
                 qt.add_row(
                     c.account + (f" · {c.provider}" if c.provider else ""), state,
                     f"{c.ok}/{c.fail}", c.plan or "—",
                     f"{c.daily_pct}%" if c.daily_pct is not None else "—",
                     f"{c.weekly_pct}%" if c.weekly_pct is not None else "—",
+                    (fmt_age(time.time() - obs).replace(" ago", "")
+                     if obs else "—"),
                     resets if resets != "—/—" else "—", eta or "—",
                     extra or "—", key=c.name)
 

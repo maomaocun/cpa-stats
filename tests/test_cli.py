@@ -133,6 +133,85 @@ class TestCollect:
             from cpa_stats.storage import load_quota_snapshot
             assert load_quota_snapshot(conn) is None
 
+    def test_credentials_refresh_when_stale(self, tmp_path):
+        """Stale quota-observable creds get a POST /credentials/refresh."""
+        refreshed = []
+        creds = {"files": [{
+            "name": "devin-a.json", "provider": "devin", "status": "active",
+            "quota": {"observed_at": "2020-01-01T00:00:00Z",
+                      "signals": {"weekly_quota_remaining_percent": "81%"}}}]}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self_inner):
+                body = json.dumps(creds if ("credentials" in self_inner.path
+                                          or "auth-files" in self_inner.path)
+                                  else []).encode()
+                self_inner.send_response(200)
+                self_inner.send_header("Content-Type", "application/json")
+                self_inner.end_headers()
+                self_inner.wfile.write(body)
+
+            def do_POST(self_inner):
+                body_len = int(self_inner.headers.get("Content-Length") or 0)
+                body = self_inner.rfile.read(body_len)
+                refreshed.append(json.loads(body).get("name"))
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            db = tmp_path / "r.db"
+            main(["collect", "--db", str(db),
+                  "--url", f"http://127.0.0.1:{server.server_address[1]}",
+                  "--mgmt-key-file", str(self._key(tmp_path)), "--once"])
+            assert refreshed == ["devin-a.json"]
+        finally:
+            server.shutdown()
+
+    def test_credentials_no_refresh_when_fresh(self, tmp_path):
+        """Fresh observations are not re-fetched."""
+        from datetime import timezone
+        recent = datetime.now(timezone.utc).isoformat()
+        refreshed = []
+        creds = {"files": [{
+            "name": "devin-a.json", "provider": "devin",
+            "quota": {"observed_at": recent,
+                      "signals": {"weekly_quota_remaining_percent": "81%"}}}]}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self_inner):
+                body = json.dumps(creds if "credentials" in self_inner.path
+                                  else []).encode()
+                self_inner.send_response(200)
+                self_inner.send_header("Content-Type", "application/json")
+                self_inner.end_headers()
+                self_inner.wfile.write(body)
+
+            def do_POST(self_inner):
+                refreshed.append(1)
+                self_inner.send_response(200)
+                self_inner.end_headers()
+                self_inner.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            db = tmp_path / "r.db"
+            main(["collect", "--db", str(db),
+                  "--url", f"http://127.0.0.1:{server.server_address[1]}",
+                  "--mgmt-key-file", str(self._key(tmp_path)), "--once"])
+            assert refreshed == []
+        finally:
+            server.shutdown()
+
     def test_v8_path_preferred(self, tmp_path):
         """v8 endpoint should be tried first and cached."""
         from cpa_stats import collector
