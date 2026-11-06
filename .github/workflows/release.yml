@@ -42,21 +42,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, name: linux-amd64 }
-          - { os: macos-latest,  name: darwin-arm64 }
+          # linux: build on the oldest runner with the SYSTEM python —
+          # setup-python's libpython needs newer glibc than target boxes
+          - { os: ubuntu-22.04, name: linux-amd64, sys: true }
+          - { os: macos-latest, name: darwin-arm64, sys: false }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - if: ${{ !matrix.sys }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"   # oldest supported — keeps libpython's
-                                   # glibc floor low enough for older boxes
-      - run: pip install -e . pyinstaller
-      - run: >
-          pyinstaller --onefile --name cpa-stats
-          --collect-all textual --collect-all rich
-          --copy-metadata cpa-stats cpa_stats_entry.py
-      - run: ./dist/cpa-stats --version
-      - run: mv dist/cpa-stats cpa-stats-${{ matrix.name }}
+          python-version: "3.12"
+      - name: build onefile binary
+        run: |
+          if [ "${{ matrix.sys }}" = "true" ]; then PY=python3; else PY=python; fi
+          $PY -m pip install -e . pyinstaller
+          $PY -m PyInstaller --onefile --name cpa-stats \
+            --collect-all textual --collect-all rich \
+            --copy-metadata cpa-stats cpa_stats_entry.py
+          ./dist/cpa-stats --version
+          mv dist/cpa-stats cpa-stats-${{ matrix.name }}
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.name }}
