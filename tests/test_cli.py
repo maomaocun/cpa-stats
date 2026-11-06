@@ -254,6 +254,47 @@ class TestCollect:
         k.write_text("test-key\n")
         return k
 
+    def test_multi_url_collect(self, tmp_path):
+        """--url a,b drains both queues and merges credential snapshots."""
+        creds_a = {"files": [{"name": "devin-a.json", "provider": "devin",
+                              "status": "active", "email": "a@x.com",
+                              "quota": {"signals": {
+                                  "weekly_quota_remaining_percent": "90%"}}}]}
+        creds_b = {"files": [{"name": "devin-b.json", "provider": "devin",
+                              "status": "active", "email": "b@x.com",
+                              "quota": {"signals": {
+                                  "weekly_quota_remaining_percent": "55%"}}}]}
+        with FakeQueue([make_rec(1), make_rec(2)], credentials=creds_a) as qa, \
+                FakeQueue([dict(make_rec(3), execution_id="e3-b"),
+                           dict(make_rec(4), execution_id="e4-b")],
+                          credentials=creds_b) as qb:
+            db = tmp_path / "r.db"
+            urls = (f"http://127.0.0.1:{qa.port},"
+                    f"http://127.0.0.1:{qb.port}")
+            main(["collect", "--db", str(db), "--url", urls,
+                  "--mgmt-key-file", str(self._key(tmp_path)), "--once"])
+            conn = sqlite3.connect(str(db))
+            conn.row_factory = sqlite3.Row
+            rows = load_rows(conn, 0)
+            assert len(rows) == 4
+            from cpa_stats.model import parse_credentials
+            from cpa_stats.storage import load_quota_snapshot
+            snap = load_quota_snapshot(conn)
+            creds = parse_credentials(snap)
+            assert len(creds) == 2
+            names = {c.name for c in creds}
+            assert any("@" in n for n in names)   # instance-tagged
+            insts = {c.instance for c in creds}
+            assert f"127.0.0.1:{qa.port}" in insts
+
+    def test_multi_url_key_mismatch_dies(self, tmp_path):
+        """Two urls but two key files must still match; empty key file dies."""
+        with pytest.raises(SystemExit):
+            main(["collect", "--db", str(tmp_path / "r.db"),
+                  "--url", "http://127.0.0.1:1,http://127.0.0.1:2",
+                  "--mgmt-key-file", str(tmp_path / "nope.key"),
+                  "--once"])
+
 
 class TestExport:
     def test_csv_and_jsonl(self, tmp_path):

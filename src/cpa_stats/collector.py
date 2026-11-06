@@ -47,10 +47,13 @@ def find_cpa_dir(args) -> Path | None:
     return None
 
 
-def load_cpa_config(args) -> CPAConfig:
+def load_cpa_configs(args) -> list[CPAConfig]:
+    """One config per CPA instance. `--url`/`CPA_URL` and `--mgmt-key-file`
+    accept comma-separated lists; a single key applies to every url."""
     cpa_dir = find_cpa_dir(args)
-    url = args.url or os.environ.get("CPA_URL")
-    if not url:
+    url_arg = args.url or os.environ.get("CPA_URL") or ""
+    urls = [u.strip().rstrip("/") for u in url_arg.split(",") if u.strip()]
+    if not urls:
         if not cpa_dir:
             die("cannot find a CLIProxyAPI install dir; pass --url or --cpa-dir")
         cfg_path = cpa_dir / "config.yaml"
@@ -62,17 +65,38 @@ def load_cpa_config(args) -> CPAConfig:
         )
         if not m:
             die(f"cannot find server port in {cfg_path}; pass --url")
-        url = f"http://127.0.0.1:{m.group(1)}"
+        urls = [f"http://127.0.0.1:{m.group(1)}"]
     key = os.environ.get("CPA_MGMT_KEY")
-    if not key:
-        key_file = Path(os.path.expanduser(str(
-            args.mgmt_key_file or (cpa_dir / "management.key" if cpa_dir else ""))))
-        if not key_file.exists():
-            die("cannot locate management.key; set CPA_MGMT_KEY, "
-                "--mgmt-key-file or --cpa-dir"
-                + (f" (tried {key_file})" if args.mgmt_key_file else ""))
-        key = key_file.read_text().strip()
-    return CPAConfig(url=url.rstrip("/"), mgmt_key=key)
+    if key:
+        keys = [key] * len(urls)
+    else:
+        kf_arg = str(args.mgmt_key_file
+                     or (cpa_dir / "management.key" if cpa_dir else ""))
+        key_files = [k.strip() for k in kf_arg.split(",") if k.strip()]
+        if len(key_files) == 1:
+            key_files *= len(urls)
+        if len(key_files) != len(urls):
+            die(f"--mgmt-key-file count ({len(key_files)}) must be 1 or match "
+                f"--url count ({len(urls)})")
+        keys = []
+        for kf in key_files:
+            key_file = Path(os.path.expanduser(kf))
+            if not key_file.exists():
+                die(f"cannot locate management key file {key_file}; set "
+                    "CPA_MGMT_KEY, --mgmt-key-file or --cpa-dir")
+            keys.append(key_file.read_text().strip())
+    return [CPAConfig(url=u, mgmt_key=k) for u, k in zip(urls, keys)]
+
+
+def load_cpa_config(args) -> CPAConfig:
+    """First configured instance (single-instance callers)."""
+    return load_cpa_configs(args)[0]
+
+
+def instance_tag(url: str) -> str:
+    """Short host:port tag distinguishing instances in merged snapshots."""
+    host = url.split("://", 1)[-1].split("/", 1)[0]
+    return host
 
 
 # Usage-queue endpoint across CPA API versions. Newest first; the first one that
@@ -214,7 +238,7 @@ def stale_quota_credentials(snap: dict, max_age_s: float, now: float) -> list[st
 
 
 def cmd_collect(args) -> None:
-    cfg = load_cpa_config(args)
+    cfgs = load_cpa_configs(args)
     db_path = Path(args.db)
     conn = open_db(db_path)
     spool = db_path.with_name("spool.jsonl")
@@ -240,7 +264,8 @@ def cmd_collect(args) -> None:
 
     from . import __version__
 
-    log(f"collector v{__version__} started: {cfg.url} -> {db_path} (interval {args.interval}s)")
+    urls = ", ".join(c.url for c in cfgs)
+    log(f"collector v{__version__} started: {urls} -> {db_path} (interval {args.interval}s)")
     meta_set(conn, "collector_pid", os.getpid())
     meta_set(conn, "collector_started", time.time())
     conn.commit()
@@ -255,21 +280,22 @@ def cmd_collect(args) -> None:
     while not stop["flag"]:
         try:
             got = 0
-            while True:
-                recs = fetch_queue(cfg, args.batch)
-                if not recs:
-                    break
-                try:
-                    got += insert_records(conn, recs)
-                except Exception as exc:  # never lose popped data
-                    with spool.open("a") as fh:
-                        for r in recs:
-                            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-                    raise RuntimeError(
-                        f"db write failed, spooled {len(recs)} records: {exc}"
-                    ) from exc
-                if len(recs) < args.batch:
-                    break
+            for cfg in cfgs:
+                while True:
+                    recs = fetch_queue(cfg, args.batch)
+                    if not recs:
+                        break
+                    try:
+                        got += insert_records(conn, recs)
+                    except Exception as exc:  # never lose popped data
+                        with spool.open("a") as fh:
+                            for r in recs:
+                                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+                        raise RuntimeError(
+                            f"db write failed, spooled {len(recs)} records: {exc}"
+                        ) from exc
+                    if len(recs) < args.batch:
+                        break
             total += got
             if got and args.verbose:
                 log(f"stored {got} records (total {total})")
@@ -300,19 +326,28 @@ def cmd_collect(args) -> None:
         if quota_every and time.time() - last_quota >= quota_every:
             try:
                 now = time.time()
-                snap = fetch_credentials(cfg)
-                if args.quota_refresh:
-                    stale = stale_quota_credentials(snap, args.quota_refresh, now)
-                    if stale:
-                        errs = [e for e in (refresh_credential(cfg, n)
-                                            for n in stale) if e is not None]
-                        snap = fetch_credentials(cfg)  # re-read post-refresh
-                        if errs:
-                            log(f"quota refresh: {len(errs)}/{len(stale)} "
-                                f"failed ({errs[0]})")
+                all_files: list = []
+                errs_total = []
+                for cfg in cfgs:
+                    snap = fetch_credentials(cfg)
+                    if args.quota_refresh:
+                        stale = stale_quota_credentials(
+                            snap, args.quota_refresh, now)
+                        if stale:
+                            errs = [e for e in (refresh_credential(cfg, n)
+                                                for n in stale) if e is not None]
+                            snap = fetch_credentials(cfg)  # re-read post-refresh
+                            errs_total += errs
+                    for f in snap.get("files") or []:
+                        if isinstance(f, dict):
+                            all_files.append(
+                                dict(f, _instance=instance_tag(cfg.url))
+                                if len(cfgs) > 1 else f)
+                if errs_total:
+                    log(f"quota refresh: {len(errs_total)} credential(s) "
+                        f"failed ({errs_total[0]})")
                 payload = {"fetched_at": now,
-                           "observed_at": snap.get("observed_at"),
-                           "files": snap.get("files") or []}
+                           "files": all_files}
                 from .model import parse_credentials
 
                 with conn:

@@ -11,7 +11,8 @@ from .model import (MIN_DECODE_MS, MIN_DECODE_TOKENS, Agg, aggregate,
                     bucket_counts, cred_sort_key, decode_tps, e2e_tps, field,
                     group_by, parse_credentials, parse_iso_ts, quota_forecast,
                     quota_pct_series, request_detail_pairs, short_endpoint,
-                    short_model, token_parts)
+                    short_model, signal_pct_series, token_parts,
+                    recovery_stats)
 from .storage import (db_totals, load_quota_history, load_quota_snapshot,
                       load_rows, meta_get)
 
@@ -268,7 +269,8 @@ def build_quota_table(creds, fetched_at=None, history=None):
         fail_cell = styled(str(c.fail), "red" if c.fail else "dim")
         t.add_row(
             Text.assemble(escape(c.account),
-                          (f" · {c.provider}", "dim") if c.provider else ""),
+                          (f" · {c.provider}", "dim") if c.provider else "",
+                          (f" @{c.instance}", "dim") if c.instance else ""),
             styled(status_txt, status_style),
             Text.assemble(str(c.ok), "/", fail_cell),
             escape(c.plan) if c.plan else "—",
@@ -690,28 +692,38 @@ def cmd_quota(args) -> None:
     conn = open_db(args.db) if getattr(args, "refresh", False) else open_db_ro(args.db)
     snap = None
     if getattr(args, "refresh", False):
-        from .collector import (fetch_credentials, load_cpa_config,
-                                refresh_credential, stale_quota_credentials)
+        from .collector import (fetch_credentials, instance_tag,
+                                load_cpa_configs, refresh_credential,
+                                stale_quota_credentials)
         from .storage import save_quota_history, save_quota_snapshot
 
-        cfg = load_cpa_config(args)
-        snap = fetch_credentials(cfg)
-        names = stale_quota_credentials(snap, 0.0, time.time())
-        if names:
-            errs = [e for e in (refresh_credential(cfg, n) for n in names)
-                    if e is not None]
-            if errs:
-                console_err = Console(stderr=True)
-                console_err.print(
-                    Text(f"quota refresh failed for "
-                         f"{len(errs)}/{len(names)}: {errs[0]}", style="yellow"))
+        cfgs = load_cpa_configs(args)
+        all_files: list = []
+        errs_all: list = []
+        for cfg in cfgs:
             snap = fetch_credentials(cfg)
+            names = stale_quota_credentials(snap, 0.0, time.time())
+            for n in names:
+                err = refresh_credential(cfg, n)
+                if err is not None:
+                    errs_all.append(err)
+            if names:
+                snap = fetch_credentials(cfg)
+            for f in snap.get("files") or []:
+                if isinstance(f, dict):
+                    all_files.append(dict(f, _instance=instance_tag(cfg.url))
+                                     if len(cfgs) > 1 else f)
+        if errs_all:
+            console_err = Console(stderr=True)
+            console_err.print(
+                Text(f"quota refresh failed for {len(errs_all)} credential(s): "
+                     f"{errs_all[0]}", style="yellow"))
         payload = {"fetched_at": time.time(),
-                   "observed_at": snap.get("observed_at"),
-                   "files": snap.get("files") or []}
+                   "files": all_files}
         with conn:
             save_quota_snapshot(conn, payload)
             save_quota_history(conn, parse_credentials(payload), time.time())
+        snap = payload
     snap = snap or load_quota_snapshot(conn)
     console = Console()
     if not snap or not isinstance(snap.get("files"), list):
@@ -771,6 +783,14 @@ def cmd_quota(args) -> None:
                 bits.append("LIMITED")
             lines.append(f"[dim]limit[/]      {escape(str(lim['label']))}: "
                          + escape(" · ".join(bits)))
+            # trend from the raw signal key stored in quota_history
+            sig_key = lim.get("sig_prefix")
+            if sig_key:
+                series = signal_pct_series(hist, f"{sig_key}-primary-used-percent")
+                if len(series) >= 2:
+                    lines.append(f"[dim]{'':>8}[/]     [cyan]"
+                                 f"{sparkline(series[-40:])}[/] "
+                                 f"{series[-1]}% remaining")
         if c.credits:
             rendered = " ".join(f"{escape(str(k))}={escape(str(v))}"
                                 for k, v in sorted(c.credits.items()))
@@ -860,6 +880,13 @@ def cmd_errors(args) -> None:
     if not fails:
         console.print(Text("no failures in window", style="dim"))
         return
+    rec = recovery_stats(rows)
+    if rec:
+        med, share = rec
+        console.print(Text(
+            f"recovery: median {fmt_ms(int(med * 1000))} until the same model "
+            f"succeeds again · {share * 100:.0f}% recover within 5m",
+            style="dim"))
     groups = group_by(fails, lambda r: (
         short_model(r), r["status_code"] or 0, field(r, "fail_code") or "",
         r["endpoint"] or ""))

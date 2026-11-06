@@ -9,7 +9,7 @@ Layout
 Keys
     1-7     window 15m / 1h / 6h / 24h / 7d / 30d / all
     up/down   select a row (mouse wheel scrolls; click selects)
-    left/right switch right-hand tabs (recent / sessions / quota / totals)
+    left/right switch right-hand tabs (recent / sessions / heatmap / quota / totals)
     tab       cycle focus between panels
     enter     detail modal (request or credential)
     enter on models row    filter everything to that model (again to clear)
@@ -201,7 +201,7 @@ def build_app():
             Binding("right", "tab(+1)", "tab ▶"),
         ]
 
-        TAB_IDS = ["recent", "sessions", "quota", "totals"]
+        TAB_IDS = ["recent", "sessions", "heatmap", "quota", "totals"]
 
         def action_tab(self, step: int):
             tc = self.query_one("#right", TabbedContent)
@@ -239,6 +239,8 @@ def build_app():
                     with TabPane("sessions", id="sessions"):
                         yield DataTable(id="sessions-table", cursor_type="row",
                                         zebra_stripes=True)
+                    with TabPane("heatmap", id="heatmap"):
+                        yield Static(id="heatmap-pane")
                     with TabPane("quota", id="quota"):
                         yield DataTable(id="quota-table", cursor_type="row",
                                         zebra_stripes=True)
@@ -434,6 +436,14 @@ def build_app():
                            datetime.fromtimestamp(max(r["ts"] for r in grp))
                            .strftime("%H:%M:%S"), key=sid)
 
+            # --- hourly heatmap (last 7d, independent of the current window)
+            hm_rows = (rows if (win is None or win >= 7 * 86400)
+                       else load_rows(self.conn, time.time() - 7 * 86400,
+                                      self.model_filter or None,
+                                      self.session_filter or None))
+            self.query_one("#heatmap-pane", Static).update(
+                _heatmap_text(hm_rows))
+
             # --- quota / credentials
             qt = self.query_one("#quota-table", DataTable)
             qt.clear()
@@ -586,6 +596,44 @@ def build_app():
                 return None
 
     return StatsApp
+
+
+def _heatmap_text(rows, days: int = 7) -> str:
+    """7d x 24h request-volume grid as markup: one sparkline block per hour."""
+    if not rows:
+        return "[dim]no requests in the last 7d[/]"
+    grid: dict = {}
+    fails: dict = {}
+    day_names: dict = {}
+    for r in rows:
+        lt = time.localtime(r["ts"])
+        key = (lt.tm_year, lt.tm_yday, lt.tm_hour)
+        day_names[(lt.tm_year, lt.tm_yday)] = time.strftime("%m-%d", lt)
+        grid[key] = grid.get(key, 0) + 1
+        if r["failed"]:
+            fails[key] = fails.get(key, 0) + 1
+    if not grid:
+        return "[dim]no requests in the last 7d[/]"
+    hi = max(grid.values())
+    blocks = " ▁▂▃▄▅▆▇█"
+    day_keys = sorted({(y, d) for y, d, _h in grid})[-days:]
+    lines = ["[dim]        0     6     12    18    hour →[/]"]
+    for dk in day_keys:
+        cells = []
+        total = fails_n = 0
+        for h in range(24):
+            n = grid.get((dk[0], dk[1], h), 0)
+            f = fails.get((dk[0], dk[1], h), 0)
+            total += n
+            fails_n += f
+            idx = min(int(n / hi * (len(blocks) - 1)), len(blocks) - 1) if n else 0
+            cells.append(blocks[idx])
+        date = day_names.get(dk, "?")
+        line = f"{date}  [cyan]{''.join(cells)}[/]  {total}"
+        if fails_n:
+            line += f"  [red]{fails_n}✗[/]"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _quota_eta_text(history_for_cred):

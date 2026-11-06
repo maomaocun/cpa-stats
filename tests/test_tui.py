@@ -158,3 +158,24 @@ async def test_session_filter_toggle(db):
         await pilot.press("enter")
         await pilot.pause()
         assert app.session_filter == ""  # toggled off
+
+
+@pytest.mark.asyncio
+async def test_heatmap_tab_and_all_window(db):
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        tc = app.query_one("#right")
+        tc.active = "heatmap"
+        await pilot.pause()
+        hm = app.query_one("#heatmap-pane")
+        assert "hour" in str(hm.render())
+        # window key 7 = all
+        await pilot.press("7")
+        await pilot.pause()
+        assert "all" in str(app.query_one("#statusbar").render())
+        # and 5 = 7d
+        await pilot.press("5")
+        await pilot.pause()
+        assert "7d" in str(app.query_one("#statusbar").render())

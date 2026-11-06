@@ -391,6 +391,53 @@ class TestCredSort:
         assert sorted([good, bad, lim], key=cred_sort_key)[0] is bad
 
 
+class TestInstanceTag:
+    def test_instance_mangles_name(self):
+        f = cred_fixture()
+        f["_instance"] = "127.0.0.1:27100"
+        (c,) = parse_credentials({"files": [f]})
+        assert c.instance == "127.0.0.1:27100"
+        assert c.name == "devin-a.json@127.0.0.1:27100"
+
+
+class TestSignalPctSeries:
+    def test_reads_history_signals(self):
+        import json, time
+        now = time.time()
+        rows = [
+            {"ts": now - 120, "signals": json.dumps(
+                {"X-Codex-Additional-Spark-Primary-Used-Percent": "3"})},
+            {"ts": now - 60, "signals": json.dumps(
+                {"x-codex-additional-spark-primary-used-percent": "10"})},
+            {"ts": now, "signals": "{bad json"},
+        ]
+        from cpa_stats.model import signal_pct_series
+        s = signal_pct_series(
+            rows, "x-codex-additional-spark-primary-used-percent")
+        assert s == [97, 90]      # remaining = 100 - used, case-insensitive
+
+
+class TestRecoveryStats:
+    def test_median_and_share(self):
+        from cpa_stats.model import recovery_stats
+        import time
+        from datetime import datetime
+        now = time.time()
+
+        def mk(dt, failed):
+            ts = datetime.fromtimestamp(now + dt).astimezone().isoformat()
+            return row(timestamp=ts, failed=failed)
+
+        rows = [mk(0, True), mk(30, False), mk(60, True), mk(400, False)]
+        med, share = recovery_stats(rows)
+        assert med == 30 or med == 340  # deltas [30, 340], midpoint element
+        assert share == 0.5
+
+    def test_none_when_clean(self):
+        from cpa_stats.model import recovery_stats
+        assert recovery_stats([row(failed=False)]) is None
+
+
 class TestDetailPairs:
     def test_covers_v3_fields(self):
         r = row(request_id="req-1", endpoint="POST /v1/responses",

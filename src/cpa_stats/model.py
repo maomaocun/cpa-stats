@@ -513,7 +513,7 @@ def _normalize_codex(c: "CredInfo", sig: dict, used: set, base: float) -> None:
             name = m.group("slug") or ns
             if not name:
                 continue
-            ent = groups.setdefault(name, {"name": name, "windows": {}})
+            ent = groups.setdefault(name, {"name": name, "ns": ns, "windows": {}})
             ent["windows"].setdefault(m.group("win"), {})[m.group("fld")] = v
             used.add(k)
             continue
@@ -522,12 +522,16 @@ def _normalize_codex(c: "CredInfo", sig: dict, used: set, base: float) -> None:
             name = m.group("slug") or ns
             if not name:
                 continue            # bare 'allowed' etc. = main-window scalar
-            ent = groups.setdefault(name, {"name": name, "windows": {}})
+            ent = groups.setdefault(name, {"name": name, "ns": ns, "windows": {}})
             ent[m.group("fld")] = v
             used.add(k)
     c.limits = []
     for name, ent in sorted(groups.items()):
-        item = {"name": name, "label": ent.get("limit-name") or name}
+        prefix = ("x-codex-code-review" if ent["ns"] == "code review"
+                  else f"x-codex-additional-{name}" if ent["ns"] == "additional"
+                  else f"x-codex-{name}")
+        item = {"name": name, "label": ent.get("limit-name") or name,
+                "sig_prefix": prefix}
         if _truthy(ent.get("limit-reached")) or _falsy(ent.get("allowed")):
             item["limited"] = True
         for win, tag in (("primary", "short"), ("secondary", "long")):
@@ -627,6 +631,7 @@ class CredInfo:
     credits: dict | None = None     # codex credits-*
     limits: list | None = None      # named extra windows (codex additional/*)
     observed_at: str = ""
+    instance: str = ""              # CPA instance host (multi-url collector)
     signals: dict | None = None
     extra: dict | None = None       # signals not normalized above
     cooldowns: list | None = None
@@ -674,6 +679,11 @@ def parse_credentials(snap) -> list[CredInfo]:
             cooldowns=list(f.get("cooldowns") or []),
             model_quotas=f.get("model_quotas") if isinstance(f.get("model_quotas"), dict) else {},
         )
+        instance = str(f.get("_instance") or f.get("instance") or "")
+        if instance:
+            c.instance = instance
+            # keep history names unique when two instances share file names
+            c.name = f"{c.name}@{instance}"
         used = _normalize_signals(c, parse_iso_ts(c.observed_at))
         c.extra = {str(k).lower(): v for k, v in signals.items()
                    if str(k).lower() not in DEVIN_QUOTA_KEYS
@@ -747,6 +757,59 @@ def quota_pct_series(history_rows, key: str = "weekly_pct") -> list:
     """pct values over time for sparklines (None-safe)."""
     return [r[key] for r in sorted(history_rows, key=lambda r: r["ts"])
             if r[key] is not None]
+
+
+def signal_pct_series(history_rows, sig_key: str) -> list:
+    """Remaining-% series for a codex used-percent signal key, read back from
+    the raw signals JSON stored in quota_history. Case-insensitive."""
+    out = []
+    want = sig_key.lower()
+    for r in sorted(history_rows, key=lambda r: r["ts"]):
+        try:
+            sig = json.loads(r["signals"] or "{}")
+        except (ValueError, TypeError, KeyError):
+            continue
+        if not isinstance(sig, dict):
+            continue
+        v = sig.get(sig_key)
+        if v is None:
+            v = next((sig[k] for k in sig if str(k).lower() == want), None)
+        rem = _remaining_from_used(v)
+        if rem is not None:
+            out.append(rem)
+    return out
+
+
+def recovery_stats(rows, within_s: float = 300.0):
+    """How fast failures recover: for each failed row, time until the next
+    successful request for the same model. Returns (median_s, share_within).
+    None when there are no failures or no following successes."""
+    import bisect
+
+    by_model_ok: dict[str, list] = {}
+    fails = []
+    for r in sorted(rows, key=lambda r: r["ts"]):
+        model = short_model(r)
+        if r["failed"]:
+            fails.append(r)
+        else:
+            by_model_ok.setdefault(model, []).append(r["ts"])
+    if not fails:
+        return None
+    deltas = []
+    for r in fails:
+        oks = by_model_ok.get(short_model(r))
+        if not oks:
+            continue
+        i = bisect.bisect_right(oks, r["ts"])
+        if i < len(oks):
+            deltas.append(oks[i] - r["ts"])
+    if not deltas:
+        return None
+    deltas.sort()
+    med = deltas[len(deltas) // 2]
+    share = sum(1 for d in deltas if d <= within_s) / len(deltas)
+    return med, share
 
 
 # --------------------------------------------------------------------------- detail view

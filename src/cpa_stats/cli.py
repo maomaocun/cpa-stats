@@ -92,53 +92,55 @@ def cmd_doctor(args) -> None:
         print(("\033[32m✓\033[0m " if good else "\033[31m✗\033[0m ") + msg)
 
     try:
-        cfg = load_cpa_config(args)
-        line(True, f"CPA endpoint {cfg.url}")
+        cfgs = load_cpa_configs(args)
+        line(True, f"CPA endpoint {cfgs[0].url}"
+                   + (f" (+{len(cfgs) - 1} more)" if len(cfgs) > 1 else ""))
     except SystemExit:
         line(False, "cannot load CPA config")
         sys.exit(1)
-    try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        body = None
-        last_code = None
-        for path in ("/v8/management/config", "/v0/management/config"):
-            req = urllib.request.Request(
-                f"{cfg.url}{path}",
-                headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
-            try:
-                with opener.open(req, timeout=5) as resp:
-                    body = json.loads(resp.read() or b"{}")
-                break
-            except urllib.error.HTTPError as exc:
-                last_code = exc.code
-                if exc.code != 404:
-                    raise
-        if body is None:
-            raise urllib.error.HTTPError(cfg.url, last_code or 404,
-                                       "management config not found", {}, None)
-        line(True, "management API reachable, key accepted")
+    for cfg in cfgs:
         try:
-            req = urllib.request.Request(
-                f"{cfg.url}/v8/management/server/latest-version",
-                headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
-            with opener.open(req, timeout=5) as resp:
-                ver = json.loads(resp.read() or b"{}")
-            latest = ver.get("latest-version") or ver.get("latest_version")
-            if latest:
-                line(True, f"latest upstream release {latest}")
-        except Exception:  # noqa: BLE001 — informational only
-            pass
-        flat = json.dumps(body)
-        m = re.search(r'"usage-statistics-enabled":\s*(true|false)', flat)
-        if m:
-            line(m.group(1) == "true", f"usage-statistics-enabled = {m.group(1)}")
-        m = re.search(r'"redis-usage-queue-retention-seconds":\s*(\d+)', flat)
-        if m:
-            line(True, f"usage queue retention = {m.group(1)}s")
-    except urllib.error.HTTPError as exc:
-        line(False, f"management API returned HTTP {exc.code}")
-    except Exception as exc:  # noqa: BLE001
-        line(False, f"CPA not reachable: {exc}")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            body = None
+            last_code = None
+            for path in ("/v8/management/config", "/v0/management/config"):
+                req = urllib.request.Request(
+                    f"{cfg.url}{path}",
+                    headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
+                try:
+                    with opener.open(req, timeout=5) as resp:
+                        body = json.loads(resp.read() or b"{}")
+                    break
+                except urllib.error.HTTPError as exc:
+                    last_code = exc.code
+                    if exc.code != 404:
+                        raise
+            if body is None:
+                raise urllib.error.HTTPError(cfg.url, last_code or 404,
+                                           "management config not found", {}, None)
+            line(True, f"{cfg.url}: management API reachable, key accepted")
+            try:
+                req = urllib.request.Request(
+                    f"{cfg.url}/v8/management/server/latest-version",
+                    headers={"Authorization": f"Bearer {cfg.mgmt_key}"})
+                with opener.open(req, timeout=5) as resp:
+                    ver = json.loads(resp.read() or b"{}")
+                latest = ver.get("latest-version") or ver.get("latest_version")
+                if latest:
+                    line(True, f"{cfg.url}: latest upstream release {latest}")
+            except Exception:  # noqa: BLE001 — informational only
+                pass
+            flat = json.dumps(body)
+            m = re.search(r'"usage-statistics-enabled":\s*(true|false)', flat)
+            if m:
+                line(m.group(1) == "true", f"usage-statistics-enabled = {m.group(1)}")
+            m = re.search(r'"redis-usage-queue-retention-seconds":\s*(\d+)', flat)
+            if m:
+                line(True, f"usage queue retention = {m.group(1)}s")
+        except urllib.error.HTTPError as exc:
+            line(False, f"{cfg.url}: management API returned HTTP {exc.code}")
+        except Exception as exc:  # noqa: BLE001
+            line(False, f"{cfg.url}: CPA not reachable: {exc}")
     db = Path(args.db)
     if db.exists():
         conn = open_db(db, readonly=True)
@@ -225,9 +227,11 @@ def main(argv=None) -> None:
                         help="SQLite path")
     common.add_argument("--cpa-dir", default=os.environ.get("CPA_DIR", str(DEFAULT_CPA_DIR)),
                         help="CLIProxyAPI install dir (reads config.yaml and management.key)")
-    common.add_argument("--url", help="CPA base URL (default: from config.yaml)")
+    common.add_argument("--url", help="CPA base URL(s), comma-separated for "
+                        "multi-instance collect (default: from config.yaml)")
     common.add_argument("--mgmt-key-file",
-                        help="management key file (default: <cpa-dir>/management.key)")
+                        help="management key file(s), comma-separated to match "
+                             "--url (default: <cpa-dir>/management.key)")
 
     filters = argparse.ArgumentParser(add_help=False)
     filters.add_argument("-m", "--model", help="filter: substring of model / alias")

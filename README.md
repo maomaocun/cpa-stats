@@ -28,6 +28,7 @@ Requires Python ≥ 3.10 and `rich`.
 
 ```bash
 cpa-stats collect &                       # start the collector
+cpa-stats collect --url http://a:8317,http://b:8317   # merge several CPA instances into one db
 cpa-stats                                 # live dashboard (default 1h window)
 cpa-stats tui                             # interactive TUI (keys/mouse)
 cpa-stats -w 15m -m swe-2                 # filter window + model
@@ -59,10 +60,11 @@ Interactive dashboard (textual). Same data as `watch`, but navigable:
 | `r` | force refresh |
 | `q` / `esc` | quit / close modal |
 
-Four tabs on the right: **recent** (every request, selectable → detail),
-**sessions** (top sessions by tokens), **quota** (per-credential quota signals,
-selectable → full cooldown/signal detail), **totals** (all-time rollup + data
-quality). The statusbar shows the lowest remaining quota across credentials.
+Five tabs on the right: **recent** (every request, selectable → detail),
+**sessions** (top sessions by tokens), **heatmap** (7-day × 24-hour request
+volume grid), **quota** (per-credential quota signals, selectable → full
+cooldown/signal detail), **totals** (all-time rollup + data quality). The
+statusbar shows the lowest remaining quota across credentials.
 
 ## Dashboard
 
@@ -119,7 +121,8 @@ leftover provider signals. Devin reads `daily_quota_*`/`weekly_quota_*`; Codex
 `x-codex-allowed` and `*-status: rejected` mark a credential **limited**;
 `Retry-After` is shown as a retry countdown. From the history, `quota`
 computes a burn forecast
-(`−N%/day → 0 in Xd`) and a trend sparkline — so an account heading for
+(`−N%/day → 0 in Xd`) and a trend sparkline — including per-named-limit
+trends for Codex `additional-*` windows — so an account heading for
 exhaustion is visible before it is blocked. `watch` also shows a red ⚠ line
 when a credential is blocked or the window failure rate exceeds 5%.
 
