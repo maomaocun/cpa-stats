@@ -127,9 +127,14 @@ def build_app():
         #body { height: 1fr; }
         #models { width: 46%; }
         #right { width: 54%; }
+        /* TabbedContent/TabPane default to height:auto — without these the
+           switcher collapses to the tab bar and tables render 0 rows tall. */
+        #right { height: 100%; }
+        #right ContentSwitcher { height: 1fr; }
+        #right TabPane { height: 100%; }
         DataTable { height: 100%; }
-        #detail { width: 78; height: auto; max-height: 90%; padding: 1 2;
-                  border: thick $primary; background: $surface; }
+        #detail { width: 92%; max-width: 110; height: auto; max-height: 90%;
+                  padding: 1 2; border: thick $primary; background: $surface; }
         #filter { dock: bottom; height: 3; display: none; }
         #statusbar { height: 1; padding: 0 1; }
         """

@@ -103,6 +103,24 @@ async def test_window_and_pause(db):
 
 
 @pytest.mark.asyncio
+async def test_right_pane_fills_body_height(db):
+    """Regression: TabbedContent defaults to height:auto and collapsed the
+    right-hand tabs to just the tab bar (tables rendered 0 rows tall)."""
+    AppCls = build_app()
+    app = AppCls(str(db))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        tc = app.query_one("#right")
+        assert tc.region.height > 10
+        for tab, sel in (("recent", "#requests-table"),
+                         ("sessions", "#sessions-table"),
+                         ("quota", "#quota-table")):
+            tc.active = tab
+            await pilot.pause()
+            assert app.query_one(sel).region.height > 5, sel
+
+
+@pytest.mark.asyncio
 async def test_quota_tab(db_with_quota):
     AppCls = build_app()
     app = AppCls(str(db_with_quota))
