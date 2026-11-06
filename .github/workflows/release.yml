@@ -30,7 +30,46 @@ jobs:
           python-version: "3.12"
       - run: pip install build
       - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  binary:
+    needs: pytest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-amd64 }
+          - { os: macos-latest,  name: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pyinstaller
+      - run: >
+          pyinstaller --onefile --name cpa-stats
+          --collect-all textual --collect-all rich
+          --copy-metadata cpa-stats cpa_stats_entry.py
+      - run: ./dist/cpa-stats --version
+      - run: mv dist/cpa-stats cpa-stats-${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: cpa-stats-${{ matrix.name }}
+
+  release:
+    needs: [pytest, build, binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: rel
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: rel/**
           generate_release_notes: true

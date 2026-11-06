@@ -18,6 +18,10 @@ cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota 
 ## Install
 
 ```bash
+# one-liner: standalone binary if your platform has one, else pipx/pip
+curl -fsSL https://raw.githubusercontent.com/maomaocun/cpa-stats/master/install.sh | sh
+
+# or from a checkout / a tag
 pipx install .          # or: pip install --user .
 cpa-stats doctor        # sanity-check CPA endpoint, key, collector, db
 ```
@@ -25,13 +29,17 @@ cpa-stats doctor        # sanity-check CPA endpoint, key, collector, db
 Requires Python ≥ 3.10 and `rich`.
 
 Tagged releases (`git tag vX.Y.Z && git push --tags`) run the release
-workflow: tests on 3.10–3.12, then a GitHub Release with the sdist + wheel.
+workflow: tests on 3.10–3.12, a PyInstaller single-file binary per platform
+(`cpa-stats-linux-amd64`, `cpa-stats-darwin-arm64`), then a GitHub Release
+with the sdist + wheel + binaries. `install.sh` prefers the binary (no
+Python needed on the target) and falls back to `pipx` / `pip --user`.
 Install straight from a tag (`pipx install
 git+https://github.com/maomaocun/cpa-stats@v2.3.0`) or download the wheel
-from the release page. `cpa-stats upgrade` checks the latest release
+or binary from the release page. `cpa-stats upgrade` checks the latest release
 against the running version and `--apply` runs the right upgrade for the
-install type (editable → `git pull --ff-only` + `pip install -e`, pipx →
-`pipx upgrade`, pip → `pip install --user -U git+…@tag`). The collector
+install type (binary → re-download, editable → `git pull --ff-only` +
+`pip install -e`, pipx → `pipx upgrade`, pip → `pip install --user -U
+git+…@tag`). The collector
 re-checks the newest release once a day; `watch`/`tui`/`doctor` show a
 `↑ vX.Y.Z` hint when you're behind.
 

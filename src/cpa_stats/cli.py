@@ -239,6 +239,23 @@ def cmd_upgrade(args) -> None:
     if new and new <= parse_version(__version__):
         print("already up to date")
         return
+    if kind == "binary":
+        from .collector import binary_release_url, download_to
+
+        url = binary_release_url(tag)
+        steps = []
+        hint = f"curl -fsSL {url} -o {detail} && chmod +x {detail}"
+        if args.apply:
+            print(f"+ download {url} -> {detail}")
+            try:
+                download_to(url, detail)
+            except Exception as exc:  # noqa: BLE001
+                die(f"download failed: {exc}")
+            print("done — restart `cpa-stats collect` (and any `tui`) "
+                  "to pick it up")
+            return
+        print(f"upgrade with: {hint}")
+        return
     if kind == "editable" and detail:
         steps = [["git", "-C", detail, "pull", "--ff-only"],
                  [sys.executable, "-m", "pip", "install", "--user", "-e", detail]]

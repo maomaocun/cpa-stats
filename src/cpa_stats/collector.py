@@ -163,7 +163,11 @@ def latest_release_tag(repo: str | None = None, timeout: float = 5.0):
 
 def install_location():
     """(kind, detail) — 'editable':repo dir, 'pipx':exe, 'pip':location,
-    'unknown':exe."""
+    'binary':exe path, 'unknown':exe."""
+    import sys as _sys
+
+    if getattr(_sys, "frozen", False) or getattr(_sys, "_MEIPASS", None):
+        return ("binary", _sys.executable)      # PyInstaller onefile build
     try:
         from importlib.metadata import distributions
 
@@ -189,6 +193,41 @@ def install_location():
         pass
     import shutil
     return ("unknown", shutil.which("cpa-stats") or "")
+
+
+def binary_asset_name() -> str:
+    """Release asset name for this platform: cpa-stats-<os>-<arch>."""
+    import platform
+
+    os_name = {"linux": "linux", "darwin": "darwin"}.get(sys.platform,
+                                                       sys.platform)
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
+            "arm64": "arm64"}.get(platform.machine().lower(),
+                                  platform.machine().lower())
+    return f"cpa-stats-{os_name}-{arch}"
+
+
+def binary_release_url(tag: str, repo: str | None = None) -> str:
+    repo = repo or DEFAULT_REPO
+    return (f"https://github.com/{repo}/releases/download/{tag}/"
+            f"{binary_asset_name()}")
+
+
+def download_to(url: str, dest) -> None:
+    """GET url -> dest (temp file + atomic rename). Proxy env vars honored."""
+    import shutil
+    import tempfile
+
+    dest = Path(dest)
+    req = urllib.request.Request(url, headers={"User-Agent": "cpa-stats"})
+    with urllib.request.build_opener().open(req, timeout=60) as resp, \
+            tempfile.NamedTemporaryFile(
+                dir=str(dest.parent), prefix=dest.name + ".",
+                delete=False) as tmp:
+        shutil.copyfileobj(resp, tmp)
+        tmp_path = Path(tmp.name)
+    tmp_path.chmod(0o755)
+    os.replace(tmp_path, dest)
 
 
 def update_notice(conn) -> str:

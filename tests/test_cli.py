@@ -867,3 +867,36 @@ class TestUpgrade:
         main(["upgrade", "--db", str(tmp_path / "r.db")])
         out = capsys.readouterr().out
         assert "v99.9.9" in out and "upgrade with" in out
+
+    def test_binary_names(self, monkeypatch):
+        import platform
+
+        import cpa_stats.collector as coll
+        monkeypatch.setattr(coll.sys, "platform", "linux")
+        monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+        assert coll.binary_asset_name() == "cpa-stats-linux-amd64"
+        monkeypatch.setattr(coll.sys, "platform", "darwin")
+        monkeypatch.setattr(platform, "machine", lambda: "arm64")
+        assert coll.binary_asset_name() == "cpa-stats-darwin-arm64"
+        assert coll.binary_release_url("v9.9.9").endswith(
+            "/v9.9.9/cpa-stats-darwin-arm64")
+
+    def test_upgrade_binary_hint(self, tmp_path, capsys, monkeypatch):
+        import cpa_stats.collector as coll
+        monkeypatch.setattr(coll, "latest_release_tag",
+                            lambda *a, **kw: "v99.9.9")
+        monkeypatch.setattr(coll, "install_location",
+                            lambda: ("binary", "/tmp/cpa-stats"))
+        main(["upgrade", "--db", str(tmp_path / "r.db")])
+        out = capsys.readouterr().out
+        assert "curl" in out and "/v99.9.9/cpa-stats-" in out
+
+
+class TestInstallSh:
+    def test_syntax(self):
+        import subprocess
+        from pathlib import Path
+
+        sh = Path(__file__).resolve().parent.parent / "install.sh"
+        r = subprocess.run(["sh", "-n", str(sh)], capture_output=True)
+        assert r.returncode == 0, r.stderr
