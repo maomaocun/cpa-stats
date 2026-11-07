@@ -35,39 +35,42 @@ jobs:
           name: dist
           path: dist/*
 
-  binary:
-    needs: pytest
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # linux: build on the oldest runner with the SYSTEM python —
-          # setup-python's libpython needs newer glibc than target boxes
-          - { os: ubuntu-22.04, name: linux-amd64, sys: true }
-          - { os: macos-latest, name: darwin-arm64, sys: false }
+  govet:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - if: ${{ !matrix.sys }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
         with:
-          python-version: "3.12"
-      - name: build onefile binary
+          go-version: "1.23"
+      - run: cd go && go vet ./... && go build ./...
+
+  binary:
+    needs: [pytest, govet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: build static binaries (CGO-free)
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          if [ "${{ matrix.sys }}" = "true" ]; then PY=python3; else PY=python; fi
-          $PY -m pip install --user -U pip setuptools wheel  # old runner's
-            # toolchain predates PEP 621 (would build a package literally
-            # named UNKNOWN) and PEP 660 (no editable installs)
-          $PY -m pip install --user . pyinstaller
-          $PY -m PyInstaller --onefile --name cpa-stats \
-            --collect-all textual --collect-all rich \
-            cpa_stats_entry.py
-          ./dist/cpa-stats --version
-          mv dist/cpa-stats cpa-stats-${{ matrix.name }}
+          cd go
+          for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            os=${t%-*}; arch=${t#*-}
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+              go build -trimpath -ldflags "-s -w -X main.Version=${TAG#v}" \
+              -o ../cpa-stats-$t .
+          done
+          file ../cpa-stats-linux-amd64
+          # smoke-check the native artifact
+          ./cpa-stats-$(go env GOOS)-$(go env GOARCH) --version || \
+            ./cpa-stats-linux-amd64 --version
       - uses: actions/upload-artifact@v4
         with:
-          name: bin-${{ matrix.name }}
-          path: cpa-stats-${{ matrix.name }}
+          name: go-binaries
+          path: cpa-stats-*
 
   release:
     needs: [pytest, build, binary]

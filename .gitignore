@@ -5,3 +5,7 @@ dist/
 *.spec
 .pytest_cache/
 CLIProxyAPI/
+go/cpa-stats
+go/cpa-stats-*
+cpa-stats-*
+go/go

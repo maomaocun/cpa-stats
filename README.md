@@ -17,6 +17,24 @@ CPA (127.0.0.1:PORT)
 cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota / export
 ```
 
+## Go rewrite (`go/`)
+
+The resident/op commands are re-implemented in Go as a single static,
+CGO-free binary (`go/`): `collect`, `serve`, `install-service` (systemd +
+launchd), `prune`, `doctor`, `alert`, `upgrade`, plus plain-text viewers
+(`summary`, `quota`, `errors`, `top`, `show`, `trend`, `tail`, `sql`,
+`export`, `report`). It writes the **same SQLite schema** as the Python
+package — collectors and viewers of either implementation interoperate
+freely on one database.
+
+```bash
+cd go && go build -o cpa-stats .
+./cpa-stats collect --url http://127.0.0.1:PORT --mgmt-key-file ~/.cliproxy/management.key
+```
+
+Only `watch` and `tui` (the rich interactive dashboards) remain
+Python-only for now.
+
 ## Install
 
 ```bash
@@ -33,8 +51,9 @@ cpa-stats doctor        # sanity-check CPA endpoint, key, collector, db
 Requires Python ≥ 3.10 and `rich`.
 
 Tagged releases (`git tag vX.Y.Z && git push --tags`) run the release
-workflow: tests on 3.10–3.12, a PyInstaller single-file binary per platform
-(`cpa-stats-linux-amd64`, `cpa-stats-darwin-arm64`), then a GitHub Release
+workflow: tests on 3.10–3.12 + `go vet`, then CGO-free static Go binaries
+per platform (`cpa-stats-linux-amd64`, `cpa-stats-linux-arm64`,
+`cpa-stats-darwin-amd64`, `cpa-stats-darwin-arm64`), then a GitHub Release
 with the sdist + wheel + binaries. `install.sh` prefers the binary (no
 Python needed on the target) and falls back to `pipx` / `pip --user`.
 Install straight from a tag (`pipx install
