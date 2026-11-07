@@ -1,15 +1,11 @@
 name: test
 on: [push, pull_request]
 jobs:
-  pytest:
+  gotest:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-go@v5
         with:
-          python-version: ${{ matrix.python }}
-      - run: pip install -e '.[test]'
-      - run: pytest -q
+          go-version: "1.23"
+      - run: cd go && go vet ./... && go test ./...
