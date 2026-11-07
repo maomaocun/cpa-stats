@@ -65,8 +65,7 @@ jobs:
           done
           file ../cpa-stats-linux-amd64
           # smoke-check the native artifact
-          ./cpa-stats-$(go env GOOS)-$(go env GOARCH) --version || \
-            ./cpa-stats-linux-amd64 --version
+          cd .. && ./cpa-stats-$(go env GOOS)-$(go env GOARCH) --version
       - uses: actions/upload-artifact@v4
         with:
           name: go-binaries
