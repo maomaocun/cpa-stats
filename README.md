@@ -17,54 +17,35 @@ CPA (127.0.0.1:PORT)
 cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota / export
 ```
 
-## Go rewrite (`go/`)
-
-The resident/op commands are re-implemented in Go as a single static,
-CGO-free binary (`go/`): `collect`, `serve`, `install-service` (systemd +
-launchd), `prune`, `doctor`, `alert`, `upgrade`, plus plain-text viewers
-(`summary`, `quota`, `errors`, `top`, `show`, `trend`, `tail`, `sql`,
-`export`, `report`). It writes the **same SQLite schema** as the Python
-package — collectors and viewers of either implementation interoperate
-freely on one database.
-
-```bash
-cd go && go build -o cpa-stats .
-./cpa-stats collect --url http://127.0.0.1:PORT --mgmt-key-file ~/.cliproxy/management.key
-```
-
-Only `watch` and `tui` (the rich interactive dashboards) remain
-Python-only for now.
+`cpa-stats` is a single static, CGO-free Go binary (source in `go/`):
+`collect`, `serve`, `install-service` (systemd + launchd), `prune`,
+`doctor`, `alert`, `upgrade`, the `watch`/`tui` dashboards and all
+plain-text viewers (`summary`, `quota`, `errors`, `top`, `show`, `trend`,
+`tail`, `sql`, `export`, `report`) — no runtime dependencies.
 
 ## Install
 
 ```bash
-# one-liner: standalone binary if your platform has one, else pipx/pip
+# one-liner: downloads the standalone binary for your platform
 curl -fsSL https://raw.githubusercontent.com/maomaocun/cpa-stats/master/install.sh | sh
 #   proxy for the GitHub downloads: CPA_STATS_PROXY / https_proxy env,
 #   or a local 127.0.0.1:7890 proxy is auto-detected
 
-# or from a checkout / a tag
-pipx install .          # or: pip install --user .
-cpa-stats doctor        # sanity-check CPA endpoint, key, collector, db
+# or build from a checkout (Go ≥ 1.21)
+cd go && go build -o cpa-stats .
+./cpa-stats doctor      # sanity-check CPA endpoint, key, collector, db
 ```
 
-Requires Python ≥ 3.10 and `rich`.
-
 Tagged releases (`git tag vX.Y.Z && git push --tags`) run the release
-workflow: tests on 3.10–3.12 + `go vet`, then CGO-free static Go binaries
-per platform (`cpa-stats-linux-amd64`, `cpa-stats-linux-arm64`,
-`cpa-stats-darwin-amd64`, `cpa-stats-darwin-arm64`), then a GitHub Release
-with the sdist + wheel + binaries. `install.sh` prefers the binary (no
-Python needed on the target) and falls back to `pipx` / `pip --user`.
-Install straight from a tag (`pipx install
-git+https://github.com/maomaocun/cpa-stats@v2.3.0`) or download the wheel
-or binary from the release page. `cpa-stats upgrade` checks the latest release
-against the running version and `--apply` runs the right upgrade for the
-install type (binary → re-download, editable → `git pull --ff-only` +
-`pip install -e`, pipx → `pipx upgrade`, pip → `pip install --user -U
-git+…@tag`). The collector
-re-checks the newest release once a day; `watch`/`tui`/`doctor` show a
-`↑ vX.Y.Z` hint when you're behind.
+workflow: `go vet` + `go test`, then CGO-free static binaries per platform
+(`cpa-stats-linux-amd64`, `cpa-stats-linux-arm64`,
+`cpa-stats-darwin-amd64`, `cpa-stats-darwin-arm64`) attached to a GitHub
+Release. `install.sh` downloads the matching binary and falls back to
+`go build` from the source tarball when your platform has none. `cpa-stats
+upgrade` checks the latest release against the running version and
+`--apply` re-downloads the binary in place. The collector re-checks the
+newest release once a day; `watch`/`tui`/`doctor` show a `↑ vX.Y.Z` hint
+when you're behind.
 
 ## Quick start
 
@@ -94,7 +75,7 @@ View commands accept `-m` (model), `-s` (session) and `-a` (account) filters.
 
 ### `cpa-stats tui`
 
-Interactive dashboard (textual). Same data as `watch`, but navigable:
+Interactive dashboard (tcell). Same data as `watch`, but navigable:
 
 | key / mouse | action |
 |-|-|
@@ -228,21 +209,29 @@ are dropped before storage.
 ## Development
 
 ```bash
-git clone <this repo> && cd cpa-stats
-pip install --user -e '.[test]'
-pytest                    # 143 tests
-python -m cpa_stats ...   # run without installing
+git clone <this repo> && cd cpa-stats/go
+go build ./...          # build
+go test ./...           # unit tests
+./cpa-stats ...         # run without installing (after go build -o cpa-stats .)
 ```
 
-Layout:
+Layout (`go/`):
 
 ```
-src/cpa_stats/
-  model.py      pure metric math + record parsing (no I/O)
-  storage.py    schema, migrations, queries
-  collector.py  usage-queue daemon
-  views.py      rich rendering
-  cli.py        argparse + entrypoint
-  format.py     number / time / sparkline formatting
-tests/          unit + end-to-end (fake usage-queue HTTP server)
+  main.go       subcommand dispatch + global flags
+  collect.go    usage-queue daemon (+ spool replay, alerts hook)
+  cpa.go        CPA management API client (usage queue, credentials)
+  record.go     upstream record → db row mapping
+  store.go      schema, migrations, aggregation, queries
+  quota.go      credential/quota normalization + burn forecast
+  viewers.go    summary / quota / errors / top / show / sql / export / report
+  trend.go      per-bucket metric sparklines
+  tail.go       live tail
+  watch.go      live dashboard (ANSI redraw)
+  tui.go        interactive dashboard (tcell) + screen.go helpers
+  serve.go      read-only web dashboard + /api/* + /metrics
+  service.go    systemd --user / launchd unit installer
+  upgrade.go    self-upgrade from GitHub releases
+  alerts.go     webhook alerts (quota transitions, failure spikes)
+  cpastats_test.go  test suite
 ```

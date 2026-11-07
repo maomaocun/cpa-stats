@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/maomaocun/cpa-stats/master/install.sh | sh
 #
-# Prefers the standalone binary from the latest GitHub release (no Python
-# needed); falls back to pipx, then pip --user, installed from the tag.
+# Downloads the standalone static binary from the latest GitHub release (no
+# Python, no CGO — a single file). When your platform has no prebuilt binary,
+# falls back to `go build` from the source tarball (Go ≥ 1.21 needed).
 # Env: CPA_STATS_REPO (fork), CPA_STATS_TAG (pin a version),
 # CPA_STATS_DEST (binary install path, default ~/.local/bin/cpa-stats),
 # CPA_STATS_PROXY (http proxy for GitHub; else https_proxy/HTTPS_PROXY;
@@ -57,18 +58,22 @@ if gh_curl -fsSL --retry 3 --retry-all-errors -C - "$url" -o "$DEST"; then
     exit 0
 fi
 
-# 2) python installers from the tag
-pkg="git+https://github.com/$REPO@$TAG"
-echo "no prebuilt binary for ${os}-${arch}; installing from source…"
-if command -v pipx >/dev/null 2>&1; then
-    pipx install "$pkg"
-elif command -v pip3 >/dev/null 2>&1; then
-    pip3 install --user "$pkg"
-elif command -v python3 >/dev/null 2>&1; then
-    python3 -m pip install --user "$pkg"
-else
-    echo "error: no binary for ${os}-${arch} and no pipx/pip3/python3 found" >&2
+# 2) build from source with Go
+echo "no prebuilt binary for ${os}-${arch}; building from source…"
+if ! command -v go >/dev/null 2>&1; then
+    echo "error: no binary for ${os}-${arch} and no 'go' toolchain found" >&2
     exit 1
 fi
-cpa-stats --version
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+gh_curl -fsSL "https://github.com/$REPO/archive/$TAG.tar.gz" \
+    -o "$tmp/src.tar.gz"
+tar -xzf "$tmp/src.tar.gz" -C "$tmp"
+srcdir="$(find "$tmp" -maxdepth 2 -name go.mod -path '*/go/*' | head -1)"
+[ -n "$srcdir" ] || { echo "error: go module not found in tarball" >&2; exit 1; }
+cd "$(dirname "$srcdir")"
+CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.Version=${TAG#v}" -o "$DEST" .
+chmod +x "$DEST"
+"$DEST" --version
 echo "done — try 'cpa-stats doctor' to check your CPA setup"

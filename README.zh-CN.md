@@ -19,30 +19,25 @@ cpa-stats collect  →  SQLite (WAL)  →  watch / tui / tail / summary / quota 
 
 ## 安装
 
+`cpa-stats` 是单个静态 Go 二进制(源码在 `go/`,CGO-free、无运行时依赖)。
+
 ```bash
-# 一行命令:平台有独立二进制就用它,否则回落到 pipx/pip
+# 一行命令:下载对应平台的独立二进制
 curl -fsSL https://raw.githubusercontent.com/maomaocun/cpa-stats/master/install.sh | sh
 
-# 或者从 checkout / tag 安装
-pipx install .          # 或: pip install --user .
-cpa-stats doctor        # 体检:CPA 端点、key、collector、数据库
+# 或从 checkout 构建(Go ≥ 1.21)
+cd go && go build -o cpa-stats .
+./cpa-stats doctor      # 体检:CPA 端点、key、collector、数据库
 ```
 
-需要 Python ≥ 3.10 和 `rich`。
-
 打 tag(`git tag vX.Y.Z && git push --tags`)会触发 release 流程:
-3.10–3.12 跑测试,每个平台出一个 PyInstaller 单文件二进制
-(`cpa-stats-linux-amd64`、`cpa-stats-darwin-arm64`),然后发布
-GitHub Release(sdist + wheel + 二进制)。`install.sh` 优先用二进制
-(目标机不需要 Python),没有对应平台的构建时回落 `pipx` /
-`pip --user`。也可以直接按 tag 安装
-(`pipx install git+https://github.com/maomaocun/cpa-stats@v2.3.0`),
-或从 release 页下载 wheel / 二进制。`cpa-stats upgrade` 对比最新
-release 和当前版本,`--apply` 按安装方式自动升级(二进制 → 重新下载;
-editable → `git pull --ff-only` + `pip install -e`;pipx → `pipx
-upgrade`;pip → `pip install --user -U git+…@tag`)。collector 每天
-重新检查一次最新 release;落后时 `watch` / `tui` / `doctor` 会显示
-`↑ vX.Y.Z` 提示。
+`go vet` + `go test`,然后每个平台出一个 CGO-free 静态二进制
+(`cpa-stats-linux-amd64`、`cpa-stats-linux-arm64`、
+`cpa-stats-darwin-amd64`、`cpa-stats-darwin-arm64`),附到 GitHub
+Release。`install.sh` 下载匹配的二进制,平台没有预编译产物时回落到
+`go build` 源码构建。`cpa-stats upgrade` 对比最新 release 和当前版本,
+`--apply` 原地重新下载二进制。collector 每天重新检查一次最新 release;
+落后时 `watch` / `tui` / `doctor` 会显示 `↑ vX.Y.Z` 提示。
 
 `install.sh` 访问 GitHub 可以走代理:`CPA_STATS_PROXY` 环境变量优先,
 其次 `https_proxy` / `HTTPS_PROXY`;都没设但本机 127.0.0.1:7890 有
@@ -77,7 +72,7 @@ cpa-stats prune --older-than 30d          # 删除旧记录
 
 ### `cpa-stats tui`
 
-交互式 dashboard(textual),数据和 `watch` 一致但可导航:
+交互式 dashboard(tcell),数据和 `watch` 一致但可导航:
 
 | 按键 / 鼠标 | 作用 |
 |-|-|
@@ -204,21 +199,29 @@ TTFT/latency/TPS、每凭证 quota %、collector 心跳)和 `/healthz`。
 ## 开发
 
 ```bash
-git clone <this repo> && cd cpa-stats
-pip install --user -e '.[test]'
-pytest                    # 143 tests
-python -m cpa_stats ...   # 免安装直接跑
+git clone <this repo> && cd cpa-stats/go
+go build ./...          # 构建
+go test ./...           # 单元测试
+./cpa-stats ...         # go build -o cpa-stats . 之后直接跑
 ```
 
-目录:
+目录(`go/`):
 
 ```
-src/cpa_stats/
-  model.py      纯指标计算 + 记录解析(无 I/O)
-  storage.py    schema、migration、查询
-  collector.py  usage-queue 守护进程
-  views.py      rich 渲染
-  cli.py        argparse + 入口
-  format.py     数字 / 时间 / sparkline 格式化
-tests/          单元 + 端到端(模拟 usage-queue HTTP 服务)
+  main.go       子命令分发 + 全局 flag
+  collect.go    usage-queue 守护进程(含 spool 重放、告警钩子)
+  cpa.go        CPA management API 客户端(usage queue、凭证)
+  record.go     上游记录 → 数据库行映射
+  store.go      schema、migration、聚合、查询
+  quota.go      凭证/quota 归一化 + burn forecast
+  viewers.go    summary / quota / errors / top / show / sql / export / report
+  trend.go      逐桶指标 sparkline
+  tail.go       实时 tail
+  watch.go      实时 dashboard(ANSI 重绘)
+  tui.go        交互式 dashboard(tcell)+ screen.go 辅助
+  serve.go      只读 web dashboard + /api/* + /metrics
+  service.go    systemd --user / launchd unit 安装器
+  upgrade.go    从 GitHub release 自升级
+  alerts.go     webhook 告警(quota 翻转、失败率尖峰)
+  cpastats_test.go  测试套件
 ```

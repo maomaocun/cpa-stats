@@ -1,0 +1,6 @@
+rich>=13
+textual>=0.86
+
+[test]
+pytest>=7
+pytest-asyncio>=0.23

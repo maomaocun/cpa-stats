@@ -11,7 +11,7 @@ import (
 )
 
 // Version is stamped by goreleaser/go build -ldflags "-X main.Version=...".
-var Version = "2.4.0"
+var Version = "2.5.0"
 
 // flagSetLike wraps flag.FlagSet with post-parse hooks (duration/price parsing).
 type flagSetLike struct {
@@ -75,7 +75,7 @@ viewers:
   report           compact digest; --webhook posts it (Lark/generic)
 
 not in the Go build (use the Python package for these):
-  watch, tui       interactive dashboards (rich/textual)
+  watch, tui       interactive dashboards
 
 env: CPA_STATS_DB CPA_DIR CPA_URL CPA_MGMT_KEY CPA_STATS_ALERT_WEBHOOK
      CPA_STATS_PRICE CPA_STATS_REPO
@@ -164,12 +164,10 @@ func main() {
 		cmdReport(g, args)
 	case "trend":
 		cmdTrend(g, args)
-	case "watch", "tui":
-		fmt.Fprintf(os.Stderr,
-			"cpa-stats: '%s' is not in the Go build yet — "+
-				"install the Python package for interactive dashboards "+
-				"(pipx install cpa-stats)\n", cmd)
-		os.Exit(2)
+	case "watch":
+		cmdWatch(g, args)
+	case "tui":
+		cmdTUI(g, args)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:

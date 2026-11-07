@@ -15,6 +15,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+
+
 const schemaVersion = 4
 
 const schemaSQL = `
@@ -815,6 +817,259 @@ func DBTotals(db *sql.DB, pricing *Pricing) *Agg {
 		a.CostUSD = &v
 	}
 	return a
+}
+
+// recoveryStats: for each failed row, time until the next successful request
+// for the same model. Returns (medianS, shareWithin300s) or nil.
+func recoveryStats(rows []Row, withinS float64) *[2]float64 {
+	byModelOK := map[string][]float64{}
+	var fails []Row
+	for _, r := range sortedRows(rows) {
+		m := shortModel(r)
+		if derefI(i64(r["failed"])) == 1 {
+			fails = append(fails, r)
+		} else {
+			if ts, ok := parseFloat(r["ts"]); ok {
+				byModelOK[m] = append(byModelOK[m], ts)
+			}
+		}
+	}
+	if len(fails) == 0 {
+		return nil
+	}
+	var deltas []float64
+	for _, r := range fails {
+		oks := byModelOK[shortModel(r)]
+		if len(oks) == 0 {
+			continue
+		}
+		ts, _ := parseFloat(r["ts"])
+		// first ok after ts
+		for _, t := range oks {
+			if t > ts {
+				deltas = append(deltas, t-ts)
+				break
+			}
+		}
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+	med := pctile(deltas, 0.5)
+	if med == nil {
+		return nil
+	}
+	within := 0
+	for _, d := range deltas {
+		if d <= withinS {
+			within++
+		}
+	}
+	return &[2]float64{*med, float64(within) / float64(len(deltas))}
+}
+
+func sortedRows(rows []Row) []Row {
+	out := make([]Row, len(rows))
+	copy(out, rows)
+	sortSlice(out, func(i, j int) bool {
+		ti, _ := parseFloat(out[i]["ts"])
+		tj, _ := parseFloat(out[j]["ts"])
+		return ti < tj
+	})
+	return out
+}
+
+func sortSlice(rows []Row, less func(i, j int) bool) {
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && less(j, j-1); j-- {
+			rows[j], rows[j-1] = rows[j-1], rows[j]
+		}
+	}
+}
+
+// requestDetailPairs: (label, value) lines describing one request.
+func requestDetailPairs(r Row) [][2]string {
+	pairs := [][2]string{}
+	add := func(k, v string) { pairs = append(pairs, [2]string{k, v}) }
+
+	raw := map[string]interface{}{}
+	if rw := strv(r["raw"]); rw != "" {
+		_ = json.Unmarshal([]byte(rw), &raw)
+	}
+	tokens := submap(raw, "tokens")
+	tb := submap(raw, "token_breakdown")
+	tbIn := submap(tb, "input")
+	tbOut := submap(tb, "output")
+
+	total, uncached, read, write := tokenParts(r)
+	var ratio *float64
+	if total > 0 {
+		v := float64(read) / float64(total)
+		ratio = &v
+	}
+	tps := decodeTPS(r["output_tokens"], r["latency_ms"], r["ttft_ms"])
+	e2e := e2eTPS(r["output_tokens"], r["latency_ms"])
+	outTok, _ := parseFloat(r["output_tokens"])
+	lat, ok1 := parseFloat(r["latency_ms"])
+	ttft, ok2 := parseFloat(r["ttft_ms"])
+	burst := derefI(i64(r["failed"])) == 0 && ok1 && ok2 &&
+		outTok >= minDecodeTokens && lat-ttft < minDecodeMS
+
+	tiers := firstNonEmpty(strv(r["service_tier"]), "—") + " → " +
+		orLabel(strv(r["effective_service_tier"]), "—") + " → " +
+		orLabel(strv(r["response_service_tier"]), "—") + " → " +
+		orLabel(strv(r["upstream_service_tier"]), "—")
+	session := orLabel(strv(r["session_id"]), "—")
+	if p := strv(r["parent_session_id"]); p != "" {
+		session += "  ← parent " + p
+	}
+	var node []string
+	if v := strv(r["node_kind"]); v != "" {
+		node = append(node, v)
+	}
+	if derefI(i64(r["is_fork"])) == 1 {
+		node = append(node, "fork")
+	}
+	if derefI(i64(r["is_compaction"])) == 1 {
+		node = append(node, "compaction")
+	}
+	nodeStr := "—"
+	if len(node) > 0 {
+		nodeStr = strings.Join(node, " / ")
+	}
+	var ips []string
+	for _, k := range []string{"client_ip", "resolved_client_ip", "x_forwarded_for"} {
+		if v := strv(r[k]); v != "" {
+			ips = append(ips, v)
+		}
+	}
+	ipsStr := "—"
+	if len(ips) > 0 {
+		ipsStr = strings.Join(ips, " / ")
+	}
+	speedGeo := "—"
+	var sg []string
+	if v := strv(r["speed"]); v != "" {
+		sg = append(sg, v)
+	}
+	if v := strv(r["inference_geo"]); v != "" {
+		sg = append(sg, v)
+	}
+	if len(sg) > 0 {
+		speedGeo = strings.Join(sg, " / ")
+	}
+	yesno := func(v interface{}) string {
+		if v == nil {
+			return "—"
+		}
+		if derefI(i64(v)) == 1 || truthy(v) {
+			return "yes"
+		}
+		return "no"
+	}
+	access := fmt.Sprintf("%s via %s",
+		orLabel(strv(r["auth_type"]), "—"),
+		orLabel(strv(r["access_provider"]), "—")) +
+		" · native " + yesno(r["is_native_key"])
+
+	status := "✓ ok"
+	if derefI(i64(r["failed"])) == 1 {
+		status = "✗ FAILED " + strv(r["status_code"])
+		if fc := strv(r["fail_code"]); fc != "" {
+			status += " (" + fc + ")"
+		}
+	}
+	status += fmt.Sprintf("  stream=%s generate=%s",
+		yesno(r["stream"]), yesno(r["generate"]))
+
+	latStr := fmtMs(f64(r["latency_ms"])) + " / " + fmtMs(f64(r["ttft_ms"]))
+	speedStr := fmtTps(tps) + " / " + fmtTps(e2e) + " tok/s"
+	if burst {
+		speedStr += "  (burst)"
+	}
+	hit := "—"
+	if ratio != nil {
+		hit = fmt.Sprintf("%.0f%%", *ratio*100)
+	}
+	inputLine := fmt.Sprintf("%s = %s new + %s read + %s write  (hit %s)",
+		fmtTok(total), fmtTok(uncached), fmtTok(read), fmtTok(write), hit)
+	if len(tbIn) > 0 {
+		inputLine += fmt.Sprintf("   breakdown: total %s · uncached %s",
+			fmtTok(tbIn["total_tokens"]), fmtTok(tbIn["uncached_tokens"]))
+	}
+	outLine := fmtTok(r["output_tokens"])
+	if rt := i64(r["reasoning_tokens"]); rt != nil && *rt > 0 {
+		outLine += "  reasoning " + fmtTok(*rt)
+	}
+	if len(tbOut) > 0 {
+		outLine += fmt.Sprintf(
+			"   breakdown: total %s · reasoning %s · non-reasoning %s",
+			fmtTok(tbOut["total_tokens"]),
+			fmtTok(tbOut["reasoning_tokens"]),
+			fmtTok(tbOut["non_reasoning_tokens"]))
+	}
+	ts, _ := parseFloat(r["ts"])
+	add("time", time.Unix(int64(ts), 0).Format("2006-01-02 15:04:05"))
+	add("model", shortModel(r)+"  (upstream: "+orLabel(strv(r["response_model"]), "—")+")")
+	add("provider / executor",
+		orLabel(strv(r["provider"]), "—")+" / "+orLabel(strv(r["executor_type"]), "—"))
+	add("effort", orLabel(strv(r["effort"]), "—"))
+	add("tier req→eff→resp→up", tiers)
+	add("endpoint", orLabel(strv(r["endpoint"]), "—"))
+	add("speed / geo", speedGeo)
+	add("account", fmt.Sprintf("%s  (auth_index %s)",
+		orLabel(strv(r["source"]), "—"), orLabel(strv(r["auth_index"]), "—")))
+	add("access", access)
+	add("session", session)
+	add("node", nodeStr)
+	add("request / exec / trace", fmt.Sprintf("%s / %s / %s",
+		orLabel(strv(r["request_id"]), "—"), strv(r["id"]),
+		orLabel(strv(r["trace_id"]), "—")))
+	add("client", orLabel(strv(r["user_agent"]), "—"))
+	add("client ip / resolved / xff", ipsStr)
+	add("status", status)
+	add("latency / TTFT", latStr)
+	add("TPS decode / e2e", speedStr)
+	add("input tokens", inputLine)
+	add("output tokens", outLine)
+	tt := r["total_tokens"]
+	if tt == nil {
+		tt = tokens["total_tokens"]
+	}
+	add("total tokens", fmtTok(tt)+"   unclassified "+
+		fmtTok(tb["unclassified_tokens"]))
+	tq := strv(r["token_quality"])
+	if tq == "" {
+		tq = strv(tb["quality"])
+	}
+	add("token quality", orLabel(tq, "—"))
+
+	// fields that only exist inside the raw upstream record
+	extraKeys := []string{
+		"cache_creation_5m_tokens", "cache_creation_30m_tokens",
+		"cache_creation_1h_tokens", "cache_creation_12h_tokens",
+		"text_input_tokens", "image_input_tokens", "audio_input_tokens",
+		"video_input_tokens", "file_input_tokens", "cached_text_tokens",
+		"text_output_tokens", "image_output_tokens", "audio_output_tokens",
+		"accepted_prediction_tokens", "rejected_prediction_tokens",
+	}
+	var extra []string
+	for _, k := range extraKeys {
+		if v := tokens[k]; v != nil {
+			extra = append(extra,
+				strings.TrimSuffix(k, "_tokens")+" "+fmtTok(v))
+		}
+	}
+	if len(extra) > 0 {
+		add("token extras", strings.Join(extra, " · "))
+	}
+	if c := strv(raw["cost"]); c != "" {
+		add("upstream cost", c)
+	}
+	if errStr := strv(r["error"]); errStr != "" {
+		add("error", errStr)
+	}
+	return pairs
 }
 
 // Prune deletes old rows (both tables) and checkpoints the WAL.

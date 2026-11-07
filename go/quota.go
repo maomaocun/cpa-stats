@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"sort"
@@ -605,4 +606,73 @@ func QuotaForecast(rows []QuotaHistRow, key string,
 		return nil
 	}
 	return &[3]float64{p1, -slope * 86400, t1 + p1/(-slope)}
+}
+
+// QuotaPctSeries: pct values over time for sparklines (None-safe).
+func QuotaPctSeries(rows []QuotaHistRow, key string) []float64 {
+	var out []float64
+	for _, r := range rows {
+		var v *int64
+		switch key {
+		case "weekly_pct":
+			v = r.WeeklyPct
+		case "daily_pct":
+			v = r.DailyPct
+		}
+		if v != nil {
+			out = append(out, float64(*v))
+		}
+	}
+	return out
+}
+
+// SignalPctSeries: remaining-% series for a codex used-percent key read back
+// from the raw signals JSON stored in quota_history (case-insensitive).
+func SignalPctSeries(rows []QuotaHistRow, sigKey string) []float64 {
+	var out []float64
+	want := strings.ToLower(sigKey)
+	for _, r := range rows {
+		var sig map[string]interface{}
+		if json.Unmarshal([]byte(r.Signals), &sig) != nil || sig == nil {
+			continue
+		}
+		v, ok := sig[sigKey]
+		if !ok || v == nil {
+			for k, vv := range sig {
+				if strings.ToLower(k) == want {
+					v = vv
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
+		if rem := remainingFromUsed(v); rem != nil {
+			out = append(out, float64(*rem))
+		}
+	}
+	return out
+}
+
+// QuotaPace: (budget %/day, burn %/day, overPace) — the %/day drain landing on
+// 0 exactly at the window reset vs current burn. nil when unknown.
+func QuotaPace(pct *int64, resetTS *float64, burnPerDay *float64,
+	now float64) *[3]float64 {
+	if pct == nil || resetTS == nil || *resetTS <= now {
+		return nil
+	}
+	budget := float64(*pct) * 86400 / (*resetTS - now)
+	over := burnPerDay != nil && *burnPerDay > budget*1.05
+	var burn float64
+	if burnPerDay != nil {
+		burn = *burnPerDay
+	} else {
+		burn = -1 // sentinel: unknown
+	}
+	if over {
+		return &[3]float64{budget, burn, 1}
+	}
+	return &[3]float64{budget, burn, 0}
 }
