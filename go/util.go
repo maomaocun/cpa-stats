@@ -87,11 +87,21 @@ func parseISOTS(value interface{}) (float64, bool) {
 	return 0, false
 }
 
-// parseFloat tolerant numeric parse ("81%", 81, "0.42").
+// parseFloat tolerant numeric parse ("81%", 81, "0.42", *int64).
 func parseFloat(value interface{}) (float64, bool) {
 	switch v := value.(type) {
 	case nil:
 		return 0, false
+	case *int64:
+		if v == nil {
+			return 0, false
+		}
+		return float64(*v), true
+	case *float64:
+		if v == nil {
+			return 0, false
+		}
+		return *v, true
 	case float64:
 		return v, true
 	case float32:
