@@ -445,7 +445,7 @@ def main(argv=None) -> None:
     c.add_argument("--alert-webhook",
                    default=os.environ.get("CPA_STATS_ALERT_WEBHOOK"),
                    help="POST text alerts to this URL on quota transitions "
-                        "(low %, blocked/limited, recovery, failure spikes; "
+                        "(low %%, blocked/limited, recovery, failure spikes; "
                         "env CPA_STATS_ALERT_WEBHOOK; Lark bot webhooks work)")
     c.add_argument("--alert-below", type=float, default=20.0,
                    help="alert when a quota window drops below this %% (default 20)")
