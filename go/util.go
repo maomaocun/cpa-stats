@@ -195,7 +195,7 @@ func fmtTok(n interface{}) string {
 	}
 	switch {
 	case f >= 1e9:
-		return fmt.Sprintf("%.2fG", f/1e9)
+		return fmt.Sprintf("%.2fB", f/1e9)
 	case f >= 1e6:
 		return fmt.Sprintf("%.2fM", f/1e6)
 	case f >= 10000:
