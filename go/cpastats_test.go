@@ -719,3 +719,22 @@ func TestInstanceTag(t *testing.T) {
 		t.Fatal("instanceTag")
 	}
 }
+
+func TestFmtTokUnits(t *testing.T) {
+	// token counts use K / M / B — B (billion) for >= 1e9 (#3)
+	cases := map[float64]string{
+		999:         "999",
+		1500:        "1.5K",
+		23345:       "23K",
+		163250888:   "163.25M",
+		999999999:   "1000.00M",
+		1000000000:  "1.00B",
+		6860000000:  "6.86B",
+		16325088888: "16.33B",
+	}
+	for in, want := range cases {
+		if got := fmtTok(in); got != want {
+			t.Fatalf("fmtTok(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
