@@ -1197,7 +1197,7 @@ func heatmapText(rows []Row) string {
 			hi = n
 		}
 	}
-	blocks := " ▁▂▃▄▅▆▇█"
+	blocks := []rune(" ▁▂▃▄▅▆▇█")
 	var dayKeys [][2]int
 	for k := range grid {
 		dk := [2]int{k.y, k.d}
@@ -1237,7 +1237,7 @@ func heatmapText(rows []Row) string {
 					idx = len(blocks) - 1
 				}
 			}
-			cells = append(cells, string([]rune(blocks)[idx]))
+			cells = append(cells, string(blocks[idx]))
 		}
 		date := dayNames[dk]
 		line := fmt.Sprintf("%s  %s  %d", date, strings.Join(cells, ""), total)
