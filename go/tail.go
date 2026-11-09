@@ -40,6 +40,9 @@ func cmdTail(g *GlobalFlags, argv []string) {
 	fs.BoolVar(&verbose, "v", false, "")
 	addFilters(fs, f)
 	mustParse(fs, argv)
+	if refresh <= 0 {
+		die("--refresh must be > 0")
+	}
 	db := OpenDBROOrDie(g.DB)
 	defer db.Close()
 
@@ -59,6 +62,9 @@ func cmdTail(g *GlobalFlags, argv []string) {
 			id := strv(r["id"])
 			if seen[id] {
 				continue
+			}
+			if len(seen) > 200000 {
+				seen = map[string]bool{} // bound memory; may re-print a few rows
 			}
 			seen[id] = true
 			if ts, ok := parseFloat(r["ts"]); ok && ts > lastTS {

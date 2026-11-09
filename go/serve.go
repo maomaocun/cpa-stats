@@ -184,8 +184,9 @@ func nowSecs() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 func withDB(g *GlobalFlags, w http.ResponseWriter, fn func(*sql.DB)) {
 	db, err := OpenDBRO(g.DB)
 	if err != nil {
-		text(w, "error: "+err.Error(), "text/plain")
+		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(500)
+		w.Write([]byte("error: " + err.Error()))
 		return
 	}
 	defer db.Close()

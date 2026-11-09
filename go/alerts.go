@@ -40,9 +40,10 @@ func fireAlert(db *sql.DB, webhook string, events []string,
 	if len(events) == 0 {
 		return
 	}
-	saveAlertState(db, state)
+	failed := 0
 	for _, e := range events {
 		if err := sendWebhook(webhook, e, 10); err != nil {
+			failed++
 			logf("alert webhook failed: %v", err)
 		} else {
 			rs := []rune(e)
@@ -51,6 +52,11 @@ func fireAlert(db *sql.DB, webhook string, events []string,
 			}
 			logf("alert sent: %s", string(rs))
 		}
+	}
+	// mark crossings as fired only once delivered — a dead webhook would
+	// otherwise swallow the alert permanently
+	if failed == 0 {
+		saveAlertState(db, state)
 	}
 }
 
