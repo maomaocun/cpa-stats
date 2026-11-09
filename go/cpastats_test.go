@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/gdamore/tcell/v2"
 	"math"
 	"path/filepath"
 	"strings"
@@ -769,5 +770,37 @@ func TestHeatmapText(t *testing.T) {
 	out := heatmapText(rows)
 	if !strings.Contains(out, "█") {
 		t.Fatalf("peak bucket should render full block:\n%s", out)
+	}
+}
+
+func TestTuiModalDraws(t *testing.T) {
+	// draw() used to never render a.modal — modalBox was dead code and
+	// pressing enter looked like a frozen screen
+	db, _ := tempDB(t)
+	defer db.Close()
+	s := tcell.NewSimulationScreen("UTF-8")
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Fini()
+	s.SetSize(120, 40)
+	app := &tuiApp{screen: s, db: db, winIdx: 1, refreshS: 2}
+	app.modal = &tuiModal{title: "req x",
+		lines: []string{"hello-modal-marker"}}
+	app.draw()
+	s.Show() // flush back buffer -> front (main loop does this each frame)
+	cells, w, h := s.GetContents()
+	var flat strings.Builder
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := cells[y*w+x]
+			if len(c.Runes) > 0 {
+				flat.WriteRune(c.Runes[0])
+			}
+		}
+		flat.WriteByte('\n')
+	}
+	if !strings.Contains(flat.String(), "hello-modal-marker") {
+		t.Fatal("modal content not rendered")
 	}
 }

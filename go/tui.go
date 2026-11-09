@@ -91,6 +91,9 @@ func cmdTUI(g *GlobalFlags, argv []string) {
 	fs.Float64Var(&refresh, "r", 2.0, "")
 	fs.StringVar(&priceStr, "price", os.Getenv("CPA_STATS_PRICE"), "")
 	mustParse(fs, argv)
+	if refresh <= 0 {
+		die("--refresh must be > 0")
+	}
 	pricing, err := ParsePricing(priceStr)
 	if err != nil {
 		die("%v", err)
@@ -175,7 +178,9 @@ func (a *tuiApp) handleEvent(e tcell.Event) bool {
 					a.modal.scroll--
 				}
 			case tcell.KeyDown:
-				a.modal.scroll++
+				if a.modal.scroll < len(a.modal.lines)-1 {
+					a.modal.scroll++
+				}
 			default:
 				if ke.Rune() == 'q' {
 					a.modal = nil
@@ -725,6 +730,9 @@ func (a *tuiApp) draw() {
 			hmRows = a.hmRows
 		}
 		for i, line := range strings.Split(heatmapText(hmRows), "\n") {
+			if i >= tabH {
+				break
+			}
 			put(s, rightX, tabY+i, stDim, line)
 		}
 
@@ -849,6 +857,28 @@ func (a *tuiApp) draw() {
 	put(s, 0, sh-1, stDim,
 		"1-7 window · ←→ tab · tab focus · ↑↓ select · enter detail/filter · "+
 			"f filter · s sort · e export · p pause · r refresh · q quit")
+
+	// detail modal overlays everything
+	if a.modal != nil {
+		mx, my, mw, mh := modalBox(s, a.modal.title, 0.8, 0.7)
+		maxScroll := len(a.modal.lines) - mh
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if a.modal.scroll > maxScroll {
+			a.modal.scroll = maxScroll
+		}
+		blank := repeats(' ', mw)
+		for i := 0; i < mh; i++ {
+			put(s, mx, my+i, stDim, blank)
+		}
+		for i, line := range a.modal.lines[a.modal.scroll:] {
+			if i >= mh {
+				break
+			}
+			putClipped(s, mx, my+i, mx+mw, stDim, line)
+		}
+	}
 }
 
 func selOrZero(focused bool, sel *int) int {

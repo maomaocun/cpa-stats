@@ -54,6 +54,9 @@ func cmdCollect(g *GlobalFlags, argv []string) {
 	fs.BoolVar(&f.verbose, "verbose", false, "")
 	fs.BoolVar(&f.verbose, "v", false, "")
 	mustParse(fs, argv)
+	if f.interval <= 0 {
+		die("--interval must be > 0")
+	}
 
 	cfgs := loadCPAConfigs(g)
 	db, err := OpenDB(g.DB)

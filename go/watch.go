@@ -43,6 +43,9 @@ func cmdWatch(g *GlobalFlags, argv []string) {
 	fs.StringVar(&priceStr, "price", os.Getenv("CPA_STATS_PRICE"), "")
 	mustParse(fs, argv)
 	var err error
+	if f.refresh <= 0 {
+		die("--refresh must be > 0")
+	}
 	if f.window, err = parseDuration(winStr); err != nil {
 		die("%v", err)
 	}

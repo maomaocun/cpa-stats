@@ -8,14 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
-
-
 
 const schemaVersion = 4
 
@@ -597,11 +596,7 @@ func pctile(vals []float64, q float64) *float64 {
 }
 
 func sort64(v []float64) {
-	for i := 1; i < len(v); i++ {
-		for j := i; j > 0 && v[j] < v[j-1]; j-- {
-			v[j], v[j-1] = v[j-1], v[j]
-		}
-	}
+	sort.Float64s(v)
 }
 
 // tokenParts mirrors model.token_parts.

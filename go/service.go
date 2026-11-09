@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,7 +53,7 @@ Wants=cliproxy-api.service
 
 [Service]
 Type=simple
-ExecStart=%s --db %s collect --retention-days %v
+ExecStart="%s" --db "%s" collect --retention-days %v
 Restart=always
 RestartSec=3
 
@@ -117,7 +118,8 @@ func installLaunchd(g *GlobalFlags, exe string, retentionDays float64, noEnable 
 	<string>%s/collector.log</string>
 </dict>
 </plist>
-`, exe, g.DB, retentionDays, logDir, logDir)
+`, html.EscapeString(exe), html.EscapeString(g.DB), retentionDays,
+		html.EscapeString(logDir), html.EscapeString(logDir))
 	path := filepath.Join(dir, "com.cpa-stats.collector.plist")
 	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
 		die("write %s: %v", path, err)

@@ -74,9 +74,6 @@ viewers:
   export           export rows as csv / jsonl
   report           compact digest; --webhook posts it (Lark/generic)
 
-not in the Go build (use the Python package for these):
-  watch, tui       interactive dashboards
-
 env: CPA_STATS_DB CPA_DIR CPA_URL CPA_MGMT_KEY CPA_STATS_ALERT_WEBHOOK
      CPA_STATS_PRICE CPA_STATS_REPO
 `
