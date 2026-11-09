@@ -438,12 +438,6 @@ func cmdQuota(g *GlobalFlags, argv []string) {
 	}
 	var tab [][]string
 	for _, c := range creds {
-		pct := func(p *int64) string {
-			if p == nil {
-				return "—"
-			}
-			return fmt.Sprintf("%d%%", *p)
-		}
 		reset := func(t *float64) string {
 			if t == nil {
 				return ""
@@ -463,8 +457,8 @@ func cmdQuota(g *GlobalFlags, argv []string) {
 		}
 		tab = append(tab, []string{
 			c.Name, c.Provider, c.Account, status,
-			pct(c.DailyPct) + reset(c.DailyReset),
-			pct(c.WeeklyPct) + reset(c.WeeklyReset) + forecast,
+			quotaBar(c.DailyPct) + reset(c.DailyReset),
+			quotaBar(c.WeeklyPct) + reset(c.WeeklyReset) + forecast,
 			fmt.Sprintf("%d/%d", c.OK, c.Fail),
 		})
 	}
@@ -724,12 +718,6 @@ func printQuotaBrief(creds []CredInfo) {
 	})
 	var tab [][]string
 	for _, c := range creds {
-		pct := func(p *int64) string {
-			if p == nil {
-				return "—"
-			}
-			return fmt.Sprintf("%d%%", *p)
-		}
 		status := c.Status
 		if c.Blocked {
 			status += " BLOCKED"
@@ -737,7 +725,7 @@ func printQuotaBrief(creds []CredInfo) {
 			status += " limited"
 		}
 		tab = append(tab, []string{c.Name, c.Provider, status,
-			pct(c.DailyPct), pct(c.WeeklyPct)})
+			quotaBar(c.DailyPct), quotaBar(c.WeeklyPct)})
 	}
 	printTable(os.Stdout, []string{"credential", "provider", "status",
 		"daily", "weekly"}, tab, nil)

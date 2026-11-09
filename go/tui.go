@@ -772,14 +772,14 @@ func (a *tuiApp) draw() {
 			}
 			daily := "—"
 			if c.DailyPct != nil {
-				daily = fmt.Sprintf("%d%%", *c.DailyPct)
+				daily = quotaBar(c.DailyPct)
 				if c.DailyLabel != "" && c.DailyLabel != "daily" {
 					daily += " " + c.DailyLabel
 				}
 			}
 			weekly := "—"
 			if c.WeeklyPct != nil {
-				weekly = fmt.Sprintf("%d%%", *c.WeeklyPct)
+				weekly = quotaBar(c.WeeklyPct)
 				if c.WeeklyLabel != "" && c.WeeklyLabel != "weekly" {
 					weekly += " " + c.WeeklyLabel
 				}
@@ -915,9 +915,10 @@ func credLines(c CredInfo, hist []QuotaHistRow) []string {
 			} else {
 				eta = " · steady"
 			}
-			add(kv.tag, fmt.Sprintf("%s  %.0f%%%s",
+			add(kv.tag, fmt.Sprintf("%s  %s%s",
+				quotaBar(kv.pct),
 				sparkline(series[maxInt(0, len(series)-40):]),
-				series[len(series)-1], eta))
+				eta))
 			if p := QuotaPace(kv.pct, kv.reset,
 				func() *float64 {
 					if fc != nil {
