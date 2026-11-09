@@ -738,3 +738,20 @@ func TestFmtTokUnits(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotaBar(t *testing.T) {
+	if quotaBar(nil) != "—" {
+		t.Fatal("nil -> —")
+	}
+	cases := map[int64]string{
+		100: "██████████ 100%",
+		62:  "██████░░░░ 62%",
+		20:  "██░░░░░░░░ 20%",
+		0:   "░░░░░░░░░░ 0%",
+	}
+	for in, want := range cases {
+		if got := quotaBar(i64(in)); got != want {
+			t.Fatalf("quotaBar(%d) = %q, want %q", in, got, want)
+		}
+	}
+}

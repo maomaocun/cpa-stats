@@ -387,10 +387,7 @@ tr.fail td{color:#c00}
 				"<th>ok/fail</th></tr>")
 			for _, c := range creds {
 				pctCell := func(p *int64) string {
-					if p == nil {
-						return "—"
-					}
-					return fmt.Sprintf("%d%%", *p)
+					return quotaBar(p)
 				}
 				fmt.Fprintf(&b,
 					"<tr><td class=l>%s</td><td>%s</td><td>%s%s</td><td>%s</td>"+

@@ -262,7 +262,7 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 				if l == "" || l == dflt {
 					l = dflt
 				}
-				return fmt.Sprintf("%d%% %s", *p, l)
+				return quotaBar(p) + " " + l
 			}
 			var eta string
 			for _, k := range []string{"weekly_pct", "daily_pct"} {

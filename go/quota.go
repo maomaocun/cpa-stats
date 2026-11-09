@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
@@ -138,6 +139,18 @@ func round(f float64) float64 {
 		return float64(int(f - 0.5))
 	}
 	return float64(int(f + 0.5))
+}
+
+// quotaBar renders remaining quota as a block bar plus the percent,
+// e.g. "██████░░░░ 62%"; "—" when the signal is missing.
+func quotaBar(p *int64) string {
+	if p == nil {
+		return "—"
+	}
+	const width = 10
+	filled := int(round(clamp(float64(*p), 0, 100) / 100 * width))
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled) +
+		fmt.Sprintf(" %d%%", *p)
 }
 
 func codexWindowReset(sig map[string]interface{}, prefix string,
