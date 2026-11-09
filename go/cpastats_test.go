@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -753,5 +754,20 @@ func TestQuotaBar(t *testing.T) {
 		if got := quotaBar(i64(in)); got != want {
 			t.Fatalf("quotaBar(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestHeatmapText(t *testing.T) {
+	// the block palette is 9 runes but 25 bytes — the max bucket used to
+	// scale against len() in bytes and panic indexing [24] of length 9
+	now := nowSecs()
+	var rows []Row
+	for i := 0; i < 5; i++ {
+		rows = append(rows, Row{"ts": now})
+	}
+	rows = append(rows, Row{"ts": now - 3600}, Row{"ts": now - 86400})
+	out := heatmapText(rows)
+	if !strings.Contains(out, "█") {
+		t.Fatalf("peak bucket should render full block:\n%s", out)
 	}
 }
