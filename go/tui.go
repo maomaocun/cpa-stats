@@ -491,7 +491,11 @@ func (a *tuiApp) draw() {
 	totals := DBTotals(a.db, a.pricing)
 	right += fmt.Sprintf("   %d stored · %s", totals.N,
 		time.Now().Format("15:04:05"))
-	put(s, sw-cellWidth(stripANSI(right))-1, y, stDim, right)
+	rx := sw - cellWidth(stripANSI(right)) - 1
+	if rx < 0 {
+		rx = 0
+	}
+	put(s, rx, y, stDim, right)
 	y += 2
 
 	// cards
@@ -589,9 +593,12 @@ func (a *tuiApp) draw() {
 	leftW := sw * 46 / 100
 	rightX := leftW + 2
 	rightW := sw - rightX
+	if rightW < 0 {
+		rightW = 0
+	}
 	bodyH := sh - y - 3
-	if bodyH < 4 {
-		bodyH = 4
+	if bodyH < 0 {
+		bodyH = 0
 	}
 
 	// models table
@@ -629,6 +636,9 @@ func (a *tuiApp) draw() {
 	put(s, tx, y, stDim, "(←→)")
 	tabY := y + 2
 	tabH := sh - tabY - 2
+	if tabH < 0 {
+		tabH = 0
+	}
 
 	switch tuiTabs[a.tabIdx] {
 	case "recent":
@@ -844,6 +854,9 @@ func (a *tuiApp) draw() {
 		lines = append(lines, fmt.Sprintf("  token data  %s clean (%d/%d)",
 			qrStr, totals.NComplete, totals.N))
 		for _, l := range lines {
+			if cy >= tabY+tabH {
+				break
+			}
 			put(s, rightX, cy, tcell.StyleDefault, l)
 			cy++
 		}
