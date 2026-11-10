@@ -11,7 +11,7 @@ import (
 )
 
 // Version is stamped by goreleaser/go build -ldflags "-X main.Version=...".
-var Version = "2.5.1"
+var Version = "2.5.2"
 
 // flagSetLike wraps flag.FlagSet with post-parse hooks (duration/price parsing).
 type flagSetLike struct {
