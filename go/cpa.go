@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -269,6 +271,34 @@ func sendWebhook(url, text string, timeout float64) error {
 	return nil
 }
 
+// githubToken resolves a token for api.github.com: GH_TOKEN / GITHUB_TOKEN
+// env first, then the `gh` CLI login (`gh auth token`, hosts.yml fallback).
+// Anonymous calls share a tiny rate limit per IP, which breaks the release
+// check behind shared proxies — the gh login raises it to a per-user quota.
+func githubToken() string {
+	for _, k := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+		if t := strings.TrimSpace(string(out)); t != "" {
+			return t
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		data, err := os.ReadFile(filepath.Join(home, ".config", "gh", "hosts.yml"))
+		if err == nil {
+			if m := ghTokenRe.FindSubmatch(data); len(m) == 2 {
+				return string(m[1])
+			}
+		}
+	}
+	return ""
+}
+
+var ghTokenRe = regexp.MustCompile(`oauth_token:\s*(\S+)`)
+
 // latestReleaseTag returns the newest GitHub release tag (falls back to tags).
 func latestReleaseTag(repo string, timeout float64) string {
 	if repo == "" {
@@ -284,6 +314,9 @@ func latestReleaseTag(repo string, timeout float64) string {
 		}
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("User-Agent", "cpa-stats/"+Version)
+		if tok := githubToken(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
 		cli := &http.Client{Transport: extClient.Transport,
 			Timeout: time.Duration(timeout * float64(time.Second))}
 		resp, err := cli.Do(req)
