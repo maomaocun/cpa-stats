@@ -804,3 +804,36 @@ func TestTuiModalDraws(t *testing.T) {
 		t.Fatal("modal content not rendered")
 	}
 }
+
+func TestTuiSmallScreens(t *testing.T) {
+	// short/narrow terminals: sections must stay inside the screen and the
+	// footer must survive (draw used to force bodyH>=4 and let tabH go
+	// negative, spilling rows over the footer line)
+	db, _ := tempDB(t)
+	defer db.Close()
+	for _, wh := range [][2]int{{120, 40}, {60, 15}, {40, 10}, {30, 8}} {
+		s := tcell.NewSimulationScreen("UTF-8")
+		if err := s.Init(); err != nil {
+			t.Fatal(err)
+		}
+		s.SetSize(wh[0], wh[1])
+		app := &tuiApp{screen: s, db: db, winIdx: 1, refreshS: 2}
+		app.modal = &tuiModal{title: "m", lines: []string{"line1", "line2"}}
+		app.draw()
+		s.Show()
+		cells, w, h := s.GetContents()
+		var flat strings.Builder
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				if c := cells[y*w+x]; len(c.Runes) > 0 {
+					flat.WriteRune(c.Runes[0])
+				}
+			}
+			flat.WriteByte('\n')
+		}
+		if !strings.Contains(flat.String(), "1-7 window") {
+			t.Fatalf("footer missing at %dx%d", wh[0], wh[1])
+		}
+		s.Fini()
+	}
+}

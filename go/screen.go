@@ -198,8 +198,24 @@ func modalBox(s tcell.Screen, title string, maxWFrac, maxHFrac float64) (x, y, w
 	if w < 40 {
 		w = 40
 	}
+	if h < 3 {
+		h = 3
+	}
+	// never exceed the terminal — narrow screens just fill
+	if w > sw {
+		w = sw
+	}
+	if h > sh {
+		h = sh
+	}
 	x = (sw - w) / 2
 	y = (sh - h) / 2
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
 	st := stBold.Foreground(tcell.ColorTeal)
 	// border
 	put(s, x, y, st, "┌"+titleBar(title, w-2)+"┐")
