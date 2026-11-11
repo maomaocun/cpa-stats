@@ -16,10 +16,37 @@ var (
 	stGreen  = tcell.StyleDefault.Foreground(tcell.ColorGreen)
 	stRed    = tcell.StyleDefault.Foreground(tcell.ColorRed)
 	stYellow = tcell.StyleDefault.Foreground(tcell.ColorYellow)
+	stPink   = tcell.StyleDefault.Foreground(tcell.ColorFuchsia)
 	stSel    = tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).
 			Foreground(tcell.ColorWhite)
 	stHdr = stDim
 )
+
+// pctStyle colors a remaining-quota percent: green ≥50, yellow 10–49, red <10.
+func pctStyle(p *int64) tcell.Style {
+	if p == nil {
+		return tcell.StyleDefault
+	}
+	switch {
+	case *p < 10:
+		return stRed
+	case *p < 50:
+		return stYellow
+	default:
+		return stGreen
+	}
+}
+
+// credStatusStyle colors a credential's status string.
+func credStatusStyle(blocked, limited bool) tcell.Style {
+	if blocked {
+		return stRed
+	}
+	if limited {
+		return stYellow
+	}
+	return stGreen
+}
 
 func cellWidth(s string) int {
 	return runewidth.StringWidth(stripANSI(s))
@@ -68,10 +95,11 @@ func clip(s string, maxW int) string {
 	return string(b)
 }
 
-// tuiRow is one display row: cell text + per-cell alignment.
+// tuiRow is one display row: cell text + per-cell alignment + per-cell styles.
 type tuiRow struct {
-	cells []string
-	right []bool
+	cells  []string
+	right  []bool
+	styles []tcell.Style // optional; zero style = inherit row style
 }
 
 // drawTable renders headers + rows into (x,y..y+maxH). Returns lines used.
@@ -138,11 +166,16 @@ func drawTable(s tcell.Screen, x, y, w, maxH int,
 			if i >= len(widths) {
 				break
 			}
+			cst := st
+			if ri != sel && i < len(r.styles) &&
+				r.styles[i] != tcell.StyleDefault {
+				cst = r.styles[i]
+			}
 			alignRight := false
 			if i < len(r.right) {
 				alignRight = r.right[i]
 			}
-			put(s, cx, cy, st, padCell(c, widths[i], alignRight))
+			put(s, cx, cy, cst, padCell(c, widths[i], alignRight))
 			cx += widths[i] + 2
 		}
 		cy++

@@ -49,6 +49,12 @@ var tuiWindows = []struct {
 }
 
 var tuiTabs = []string{"recent", "sessions", "trend", "heatmap", "quota", "totals"}
+
+// segT is a statusbar segment: text + style.
+type segT struct {
+	t  string
+	st tcell.Style
+}
 var modelSorts = []string{"req", "in", "out", "tps", "lat"}
 
 type tuiApp struct {
@@ -466,36 +472,48 @@ func (a *tuiApp) draw() {
 	left := fmt.Sprintf(" cpa-stats   window %s",
 		tuiWindows[a.winIdx].label)
 	put(s, 0, y, stCyanB, left)
-	upd := updateNotice(a.db)
-	right := status
-	if upd != "" {
-		right += "  ↑ " + upd
+	var segs []segT
+	collSt := stRed
+	if strings.Contains(status, "live") {
+		collSt = stGreen
 	}
-	right += quotaChip(a.creds)
+	segs = append(segs, segT{status, collSt})
+	if upd := updateNotice(a.db); upd != "" {
+		segs = append(segs, segT{"  ↑ " + upd, stYellow})
+	}
+	segs = append(segs, quotaChipSegs(a.creds)...)
 	if a.modelSort != 0 {
-		right += fmt.Sprintf("   sort %s", modelSorts[a.modelSort])
+		segs = append(segs, segT{fmt.Sprintf("   sort %s",
+			modelSorts[a.modelSort]), stDim})
 	}
 	if a.sessFilter != "" {
 		sf := a.sessFilter
 		if len(sf) > 8 {
 			sf = sf[len(sf)-8:]
 		}
-		right += fmt.Sprintf("   sess %s", sf)
+		segs = append(segs, segT{fmt.Sprintf("   sess %s", sf), stPink})
 	}
 	if a.modelFilter != "" {
-		right += fmt.Sprintf("   filter %s", a.modelFilter)
+		segs = append(segs, segT{fmt.Sprintf("   filter %s",
+			a.modelFilter), stPink})
 	}
 	if a.paused {
-		right += "   PAUSED"
+		segs = append(segs, segT{"   PAUSED", stYellow})
 	}
 	totals := DBTotals(a.db, a.pricing)
-	right += fmt.Sprintf("   %d stored · %s", totals.N,
-		time.Now().Format("15:04:05"))
-	rx := sw - cellWidth(stripANSI(right)) - 1
+	segs = append(segs, segT{fmt.Sprintf("   %d stored · %s", totals.N,
+		time.Now().Format("15:04:05")), stDim})
+	totalW := 0
+	for _, sg := range segs {
+		totalW += cellWidth(sg.t)
+	}
+	rx := sw - totalW - 1
 	if rx < 0 {
 		rx = 0
 	}
-	put(s, rx, y, stDim, right)
+	for _, sg := range segs {
+		rx = put(s, rx, y, sg.st, sg.t)
+	}
 	y += 2
 
 	// cards
@@ -605,13 +623,18 @@ func (a *tuiApp) draw() {
 	var mrows []tuiRow
 	for _, grp := range a.modelGroups() {
 		ag := Aggregate(grp.rows, win, a.pricing)
+		var mstyles []tcell.Style
+		if ag.Failed > 0 {
+			mstyles = make([]tcell.Style, 10)
+			mstyles[2] = stRed
+		}
 		mrows = append(mrows, tuiRow{cells: []string{
 			grp.name, fmt.Sprint(ag.N), fmt.Sprint(ag.Failed),
 			fmtMs(ag.TTFTP50), fmtTps(ag.TPSP50), fmtTps(ag.E2EP50),
 			fmtTok(ag.InTok), fmtTok(ag.Uncached), fmtPct(ag.CacheRatio),
 			fmtTok(ag.OutTok),
 		}, right: []bool{false, true, true, true, true, true, true, true,
-			true, true}})
+			true, true}, styles: mstyles})
 	}
 	mh := "model"
 	if a.focusPanel == 0 {
@@ -660,8 +683,16 @@ func (a *tuiApp) draw() {
 				e2e = e2eTPS(r["output_tokens"], r["latency_ms"])
 			}
 			status := "✓"
+			statusSt := stGreen
 			if failed {
 				status = "✗"
+				if sc := strv(r["status_code"]); sc != "" {
+					status += " " + sc
+				}
+				if fc := strv(r["fail_code"]); fc != "" {
+					status += " " + fc
+				}
+				statusSt = stRed
 			}
 			tpsCell := fmtTps(tps)
 			outT, _ := parseFloat(r["output_tokens"])
@@ -675,6 +706,8 @@ func (a *tuiApp) draw() {
 			if len(sess) > 8 {
 				sess = sess[len(sess)-8:]
 			}
+			rstyles := make([]tcell.Style, 13)
+			rstyles[12] = statusSt
 			rows = append(rows, tuiRow{cells: []string{
 				time.Unix(int64(ts), 0).Format("15:04:05"), shortModel(r),
 				shortEndpoint(strv(r["endpoint"])), strv(r["effort"]),
@@ -682,7 +715,7 @@ func (a *tuiApp) draw() {
 				fmtMs(f64(r["ttft_ms"])), fmtMs(f64(r["latency_ms"])),
 				tpsCell, fmtTps(e2e), sess, status,
 			}, right: []bool{false, false, false, false, true, true, true,
-				true, true, true, true, false, false}})
+				true, true, true, true, false, false}, styles: rstyles})
 		}
 		drawTable(s, rightX, tabY, rightW, tabH,
 			[]string{"time", "model", "endpoint", "effort", "in", "hit",
@@ -699,13 +732,18 @@ func (a *tuiApp) draw() {
 					last = ts
 				}
 			}
+			var sstyles []tcell.Style
+			if ag.Failed > 0 {
+				sstyles = make([]tcell.Style, 8)
+				sstyles[2] = stRed
+			}
 			rows = append(rows, tuiRow{cells: []string{
 				truncateRunes(grp.name, 16), fmt.Sprint(ag.N),
 				fmt.Sprint(ag.Failed), fmtTok(ag.InTok), fmtTok(ag.Uncached),
 				fmtTok(ag.OutTok), fmtMs(ag.LatP50),
 				time.Unix(int64(last), 0).Format("15:04:05"),
 			}, right: []bool{false, true, true, true, true, true, true,
-				true}})
+				true}, styles: sstyles})
 		}
 		drawTable(s, rightX, tabY, rightW, tabH,
 			[]string{"session", "req", "fail", "in", "new", "out",
@@ -743,7 +781,12 @@ func (a *tuiApp) draw() {
 			if i >= tabH {
 				break
 			}
-			put(s, rightX, tabY+i, stDim, line)
+			if j := strings.Index(line, "✗"); j >= 0 {
+				put(s, rightX, tabY+i, stDim, line[:j])
+				put(s, rightX+cellWidth(line[:j]), tabY+i, stRed, line[j:])
+			} else {
+				put(s, rightX, tabY+i, stDim, line)
+			}
 		}
 
 	case "quota":
@@ -802,12 +845,19 @@ func (a *tuiApp) draw() {
 					weekly += " " + c.WeeklyLabel
 				}
 			}
+			qstyles := make([]tcell.Style, 10)
+			qstyles[1] = credStatusStyle(c.Blocked, c.Limited)
+			if c.Fail > 0 {
+				qstyles[2] = stYellow
+			}
+			qstyles[4] = pctStyle(c.DailyPct)
+			qstyles[5] = pctStyle(c.WeeklyPct)
 			rows = append(rows, tuiRow{cells: []string{
 				c.Account + orLabel("·"+c.Provider, ""),
 				state, fmt.Sprintf("%d/%d", c.OK, c.Fail),
 				orLabel(c.Plan, "—"), daily, weekly, obs, resets, eta,
 				orLabel(strings.Join(extra, " "), "—"),
-			}})
+			}, styles: qstyles})
 		}
 		drawTable(s, rightX, tabY, rightW, tabH,
 			[]string{"account", "status", "ok/fail", "plan", "daily",
@@ -889,7 +939,18 @@ func (a *tuiApp) draw() {
 			if i >= mh {
 				break
 			}
-			putClipped(s, mx, my+i, mx+mw, stDim, line)
+			if len(line) > 26 && strings.TrimSpace(line[:24]) != "" {
+				vst := tcell.StyleDefault
+				if strings.Contains(line[26:], "✗ FAILED") {
+					vst = stRed
+				} else if strings.Contains(line[26:], "✓ ok") {
+					vst = stGreen
+				}
+				putClipped(s, mx, my+i, mx+mw, stDim, line[:26])
+				putClipped(s, mx+26, my+i, mx+mw, vst, line[26:])
+			} else {
+				putClipped(s, mx, my+i, mx+mw, stDim, line)
+			}
 		}
 	}
 }
@@ -1092,7 +1153,9 @@ func credLines(c CredInfo, hist []QuotaHistRow) []string {
 	return lines
 }
 
-func quotaChip(creds []CredInfo) string {
+// quotaChipSegs: the lowest remaining quota across credentials, colored.
+func quotaChipSegs(creds []CredInfo) []segT {
+	var segs []segT
 	var daily, weekly *int64
 	for _, c := range creds {
 		if c.DailyPct != nil && (daily == nil || *c.DailyPct < *daily) {
@@ -1103,7 +1166,7 @@ func quotaChip(creds []CredInfo) string {
 		}
 	}
 	if daily == nil && weekly == nil {
-		return ""
+		return nil
 	}
 	dl, wl := "d", "w"
 	for _, c := range creds {
@@ -1120,12 +1183,14 @@ func quotaChip(creds []CredInfo) string {
 			}
 		}
 	}
-	txt := "   quota"
+	segs = append(segs, segT{"   quota", stDim})
 	if daily != nil {
-		txt += fmt.Sprintf(" %s%d%%", dl, *daily)
+		segs = append(segs,
+			segT{fmt.Sprintf(" %s%d%%", dl, *daily), pctStyle(daily)})
 	}
 	if weekly != nil {
-		txt += fmt.Sprintf(" %s%d%%", wl, *weekly)
+		segs = append(segs,
+			segT{fmt.Sprintf(" %s%d%%", wl, *weekly), pctStyle(weekly)})
 	}
 	var blocked, limited bool
 	for _, c := range creds {
@@ -1133,11 +1198,11 @@ func quotaChip(creds []CredInfo) string {
 		limited = limited || c.Limited
 	}
 	if blocked {
-		txt += " blocked"
+		segs = append(segs, segT{" blocked", stRed})
 	} else if limited {
-		txt += " limited"
+		segs = append(segs, segT{" limited", stYellow})
 	}
-	return txt
+	return segs
 }
 
 func trendLinesText(aggs []*Agg) []string {
