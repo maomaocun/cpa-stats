@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"golang.org/x/term"
 )
 
@@ -107,6 +108,11 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 	if w <= 0 {
 		w = 120
 	}
+	statusSt := stRed
+	if strings.Contains(status, "live") {
+		statusSt = stGreen
+	}
+	status = ansiWrap(status, statusSt)
 	padN := w - cellWidth(title) - cellWidth(stripANSI(status)) - 14
 	if padN < 1 {
 		padN = 1
@@ -276,6 +282,10 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 					break
 				}
 			}
+			qstyles := make([]tcell.Style, 8)
+			qstyles[1] = credStatusStyle(c.Blocked, c.Limited)
+			qstyles[4] = pctStyle(c.DailyPct)
+			qstyles[5] = pctStyle(c.WeeklyPct)
 			tab = append(tab, tuiRow{cells: []string{
 				c.Account + orLabel("·"+c.Provider, ""),
 				state, fmt.Sprintf("%d/%d", c.OK, c.Fail),
@@ -284,7 +294,7 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 				pct(c.WeeklyPct, c.WeeklyLabel, "weekly"),
 				orLabel(fmtReset(c.DailyReset)+"/"+fmtReset(c.WeeklyReset), "—"),
 				orLabel(eta, "—"),
-			}})
+			}, styles: qstyles})
 		}
 		b.WriteString(renderTableText(
 			[]string{"account", "status", "ok/fail", "plan",
@@ -393,8 +403,16 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 			e2e = e2eTPS(r["output_tokens"], r["latency_ms"])
 		}
 		status := "✓"
+		statusSt := stGreen
 		if failed {
 			status = "✗"
+			if sc := strv(r["status_code"]); sc != "" {
+				status += " " + sc
+			}
+			if fc := strv(r["fail_code"]); fc != "" {
+				status += " " + fc
+			}
+			statusSt = stRed
 		}
 		tpsCell := fmtTps(tps)
 		if !failed && tps == nil && derefI(i64(r["output_tokens"])) >=
@@ -405,6 +423,8 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 		if len(sess) > 8 {
 			sess = sess[len(sess)-8:]
 		}
+		rstyles := make([]tcell.Style, 13)
+		rstyles[12] = statusSt
 		rtab = append(rtab, tuiRow{cells: []string{
 			time.Unix(int64(ts), 0).Format("15:04:05"), shortModel(r),
 			shortEndpoint(strv(r["endpoint"])), strv(r["effort"]),
@@ -412,7 +432,7 @@ func dashboardText(db *sql.DB, f *watchFlags) string {
 			fmtMs(f64(r["ttft_ms"])), fmtMs(f64(r["latency_ms"])),
 			tpsCell, fmtTps(e2e), sess, status,
 		}, right: []bool{false, false, false, false, true, true, true, true,
-			true, true, true, false, false}})
+			true, true, true, false, false}, styles: rstyles})
 	}
 	b.WriteString(renderTableText([]string{"time", "model", "endpoint",
 		"effort", "in", "hit", "out", "TTFT", "lat", "TPS", "e2e", "session",
@@ -448,6 +468,50 @@ func fmtReset(ts *float64) string {
 		return fmtCountdown(d)
 	}
 	return time.Unix(int64(*ts), 0).Format("01-02 15:04")
+}
+
+// ansiWrap wraps s in an SGR color code (no-op when not a terminal).
+var ansiOn = -1 // tri-state: -1 unknown, 0 off, 1 on
+
+func ansiEnabled() bool {
+	if ansiOn < 0 {
+		if term.IsTerminal(int(os.Stdout.Fd())) {
+			ansiOn = 1
+		} else {
+			ansiOn = 0
+		}
+	}
+	return ansiOn == 1
+}
+
+func ansiCode(st tcell.Style) int {
+	_, fg, _ := st.Decompose()
+	switch fg {
+	case tcell.ColorRed:
+		return 31
+	case tcell.ColorGreen:
+		return 32
+	case tcell.ColorYellow:
+		return 33
+	case tcell.ColorTeal:
+		return 36
+	case tcell.ColorFuchsia:
+		return 35
+	case tcell.ColorGray:
+		return 90
+	}
+	return 0
+}
+
+func ansiWrap(s string, st tcell.Style) string {
+	if !ansiEnabled() {
+		return s
+	}
+	code := ansiCode(st)
+	if code == 0 {
+		return s
+	}
+	return fmt.Sprintf("\x1b[%dm%s\x1b[0m", code, s)
 }
 
 func collectorStatus(db *sql.DB) string {
@@ -575,7 +639,11 @@ func renderTableText(headers []string, rows []tuiRow) string {
 			if i < len(r.right) {
 				right = r.right[i]
 			}
-			b.WriteString(padCell(c, widths[i], right))
+			cell := padCell(c, widths[i], right)
+			if i < len(r.styles) && r.styles[i] != tcell.StyleDefault {
+				cell = ansiWrap(cell, r.styles[i])
+			}
+			b.WriteString(cell)
 			if i < len(headers)-1 {
 				b.WriteString("  ")
 			}
